@@ -1,0 +1,147 @@
+import os
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import mm
+from reportlab.pdfgen import canvas
+
+
+def get_code_files(directory, excluded_files=None, excluded_dirs=None):
+    """Fetch all .py files from the given directory (excluding sensitive files and dirs)."""
+    if excluded_files is None:
+        excluded_files = {
+            ".DS_Store",
+            "Thumbs.db",
+            "Desktop.ini",
+            "__init__.py", 
+            "pdf_gen.py",  
+        }
+
+    if excluded_dirs is None:
+        excluded_dirs = {
+            "node_modules",
+            ".git",
+            "__pycache__",
+            "build",
+            "dist",
+            "logs",
+            "venv",
+            "env",
+        }
+
+    code_files = {}
+
+    for root, dirs, files in os.walk(directory):
+        # Skip excluded directories
+        dirs[:] = [d for d in dirs if d not in excluded_dirs]
+
+        for file in files:
+            # Skip excluded files
+            if file in excluded_files:
+                continue
+
+            # Only include Python files
+            if not file.endswith(".py"):
+                continue
+
+            file_path = os.path.join(root, file)
+
+            try:
+                with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                    code_files[file_path] = f.readlines()
+            except Exception as e:
+                print(f"❌ Error reading {file_path}: {e}")
+                code_files[file_path] = [f"[Error reading file: {str(e)}]"]
+
+    return code_files
+
+
+def create_pdf(code_data, output_pdf="Python_Code_Export.pdf"):
+    c = canvas.Canvas(output_pdf, pagesize=A4)
+    width, height = A4
+    margin = 20 * mm
+    line_height = 10
+    y = height - margin
+
+    # Title
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(margin, y, "🐍 Python Project Code Export")
+    y -= 3 * line_height
+
+    file_paths = sorted(list(code_data.keys()))
+
+    # File list
+    c.setFont("Courier", 8)
+    for path in file_paths:
+        if y < margin:
+            c.showPage()
+            c.setFont("Courier", 8)
+            y = height - margin
+        display_path = os.path.relpath(path)
+        c.drawString(margin, y, f"- [PY] {display_path}")
+        y -= line_height
+
+    # Page break before code content
+    c.showPage()
+    y = height - margin
+
+    # File contents
+    for file_path in file_paths:
+        lines = code_data[file_path]
+        print(f"📄 Adding: {file_path}")
+
+        if y < margin + 3 * line_height:
+            c.showPage()
+            y = height - margin
+
+        # File header
+        rel_path = os.path.relpath(file_path)
+        c.setFont("Helvetica-Bold", 12)
+        c.drawString(margin, y, f"📄 File: {rel_path}")
+        y -= line_height
+
+        # Separator
+        c.setFont("Courier", 8)
+        c.drawString(margin, y, "=" * 80)
+        y -= line_height
+
+        # File content
+        for line_num, line in enumerate(lines, 1):
+            if y < margin:
+                c.showPage()
+                c.setFont("Courier", 8)
+                y = height - margin
+
+            line = line.strip("\n").encode("latin-1", "replace").decode("latin-1")
+            display_line = f"{line_num:3d}: {line[:280]}"
+            c.drawString(margin, y, display_line)
+            y -= line_height
+
+        # Spacing
+        y -= line_height
+        if y > margin:
+            c.drawString(margin, y, "-" * 80)
+            y -= 2 * line_height
+
+    c.save()
+    print(f"✅ PDF successfully created: {output_pdf}")
+    print(f"📊 Total files processed: {len(code_data)}")
+
+
+def main():
+    root_dir = os.path.dirname(os.path.abspath(__file__))
+
+    print("🔍 Scanning for Python files...")
+    code_files = get_code_files(root_dir)
+
+    if not code_files:
+        print("❌ No Python files found to process!")
+        return
+
+    print(f"📁 Found {len(code_files)} Python files to include in PDF")
+    for file_path in sorted(code_files.keys()):
+        print(f"   📄 {os.path.relpath(file_path)}")
+
+    create_pdf(code_files)
+
+
+if __name__ == "__main__":
+    main()
