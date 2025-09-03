@@ -3,7 +3,7 @@ Configuration settings for the Neural-Geometric 3D Model Generator
 Enhanced with dynamic curriculum and adaptive training strategies
 """
 from dataclasses import dataclass
-from typing import Tuple, Dict, Any, Optional
+from typing import Tuple, Dict, Any, Optional, List
 import torch
 
 
@@ -46,7 +46,15 @@ class CurriculumConfig:
     stage_switch_patience: int = 5  # Epochs without improvement before switching
     min_improvement_threshold: float = 0.001  # Minimum relative improvement
     plateau_detection_window: int = 3  # Rolling window for plateau detection
-    
+
+    # GradNorm / gradient tracking (added to satisfy trainer)
+    # window length for rolling gradient norm statistics used by GradNorm
+    gradient_norm_window: int = 100
+
+    # Objectives for multi-objective optimization (used by GradNorm/monitoring)
+    # If trainer expects `config.objectives`, this provides a sensible default.
+    objectives: Optional[List[str]] = None
+
     # Topology-aware scheduling
     topology_schedule: str = "progressive"  # "progressive", "linear_ramp", "exponential"
     topology_start_weight: float = 0.1
@@ -67,6 +75,7 @@ class CurriculumConfig:
     graph_end_weight: float = 0.5
     
     def __post_init__(self):
+        # Provide default loss schedule if not set
         if self.loss_schedule is None:
             self.loss_schedule = {
                 "segmentation": "static",      # Keep constant
@@ -79,6 +88,20 @@ class CurriculumConfig:
                 "latent_consistency": "mid_ramp",  # Activate mid-training
                 "graph": "delayed_ramp"       # Activate after polygons stable
             }
+
+        # Default objectives used by GradNorm / trainer monitoring
+        if self.objectives is None:
+            self.objectives = [
+                "segmentation",
+                "dice",
+                "sdf",
+                "attributes",
+                "polygon",
+                "voxel",
+                "topology",
+                "latent_consistency",
+                "graph"
+            ]
 
 
 @dataclass
@@ -114,7 +137,7 @@ class TrainingConfig:
     
     # Gradient monitoring for dynamic weighting
     track_gradient_norms: bool = True
-    gradient_norm_window: int = 10  # Rolling window for gradient tracking
+    gradient_norm_window: int = 10  # Rolling window for gradient tracking (legacy / trainer may use either)
     
     checkpoint_freq: int = 5
     

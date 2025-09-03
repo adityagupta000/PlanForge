@@ -179,7 +179,9 @@ class ResearchGradeLoss(nn.Module):
         graph_constraint_weight: float = 0.3,
         enable_dynamic_weighting: bool = True,
         gradnorm_alpha: float = 0.12,
-        device: str = 'cuda'
+        device: str = 'cuda',
+        weight_update_freq: int = 10,
+        weight_momentum: float = 0.9,
     ):
         super().__init__()
 
@@ -209,8 +211,10 @@ class ResearchGradeLoss(nn.Module):
         self.enable_dynamic_weighting = enable_dynamic_weighting
         if enable_dynamic_weighting:
             self.loss_weighter = DynamicLossWeighter(
-                list(self.initial_weights.keys()), alpha=gradnorm_alpha, device=device
+                list(self.initial_weights.keys()), alpha=gradnorm_alpha, device=device,
             )
+            self.loss_weighter.update_freq = weight_update_freq
+            self.loss_weighter.momentum = weight_momentum
         
         self.device = device
     

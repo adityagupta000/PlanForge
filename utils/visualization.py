@@ -7,6 +7,7 @@ import numpy as np
 import cv2
 import torch
 from pathlib import Path
+from evaluation.metrics import compute_iou
 
 
 def plot_training_history(history, save_path="training_history.png"):
@@ -14,7 +15,7 @@ def plot_training_history(history, save_path="training_history.png"):
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
 
     for idx, (stage, data) in enumerate(history.items()):
-        if data["train_loss"]:  # Only plot if stage was executed
+        if isinstance(data, dict) and "train_loss" in data and data["train_loss"]:  # Only plot if stage was executed
             axes[idx].plot(data["train_loss"], label="Train", linewidth=2)
             axes[idx].plot(data["val_loss"], label="Validation", linewidth=2)
             axes[idx].set_title(f"{stage.upper()} Training")
@@ -26,6 +27,137 @@ def plot_training_history(history, save_path="training_history.png"):
     plt.tight_layout()
     plt.savefig(save_path, dpi=300, bbox_inches="tight")
     plt.show()
+
+
+def plot_curriculum_analysis(history, save_path="curriculum_analysis.png"):
+    """Plot curriculum learning analysis including stage transitions and adaptive behavior"""
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    
+    # Plot 1: Stage transition timeline
+    if "stage_transitions" in history and history["stage_transitions"]:
+        transitions = history["stage_transitions"]
+        
+        # Extract transition epochs and reasons
+        transition_epochs = [t["epoch"] for t in transitions]
+        transition_stages = [t["from_stage"] + " → " + t["to_stage"] for t in transitions]
+        transition_reasons = [t.get("reason", "threshold") for t in transitions]
+        
+        # Create timeline
+        y_positions = range(len(transition_epochs))
+        colors = ['red' if 'patience' in reason else 'green' for reason in transition_reasons]
+        
+        axes[0, 0].barh(y_positions, transition_epochs, color=colors, alpha=0.7)
+        axes[0, 0].set_yticks(y_positions)
+        axes[0, 0].set_yticklabels(transition_stages)
+        axes[0, 0].set_xlabel("Epoch")
+        axes[0, 0].set_title("Stage Transition Timeline")
+        axes[0, 0].grid(True, alpha=0.3)
+        
+        # Add legend
+        axes[0, 0].legend(['Patience-based', 'Threshold-based'], loc='lower right')
+    else:
+        axes[0, 0].text(0.5, 0.5, "No stage transitions recorded", 
+                       ha='center', va='center', transform=axes[0, 0].transAxes)
+        axes[0, 0].set_title("Stage Transition Timeline")
+    
+    # Plot 2: Loss component evolution
+    if "dynamic_weights" in history and history["dynamic_weights"]:
+        weight_data = history["dynamic_weights"]
+        epochs = [entry["epoch"] for entry in weight_data]
+        
+        # Plot each loss component weight
+        weight_names = list(weight_data[0]["weights"].keys()) if weight_data else []
+        for weight_name in weight_names[:5]:  # Limit to top 5 for readability
+            weights = [entry["weights"].get(weight_name, 0) for entry in weight_data]
+            if any(w > 0.001 for w in weights):  # Only plot significant weights
+                axes[0, 1].plot(epochs, weights, label=weight_name, linewidth=2, marker='o', markersize=3)
+        
+        axes[0, 1].set_xlabel("Global Epoch")
+        axes[0, 1].set_ylabel("Loss Weight")
+        axes[0, 1].set_title("Dynamic Loss Weight Evolution")
+        axes[0, 1].legend()
+        axes[0, 1].grid(True, alpha=0.3)
+    else:
+        axes[0, 1].text(0.5, 0.5, "No dynamic weights recorded", 
+                       ha='center', va='center', transform=axes[0, 1].transAxes)
+        axes[0, 1].set_title("Dynamic Loss Weight Evolution")
+    
+    # Plot 3: Curriculum progress indicators
+    if "curriculum_events" in history and history["curriculum_events"]:
+        events = history["curriculum_events"]
+        event_types = {}
+        
+        for event in events:
+            event_type = event.get("type", "unknown")
+            if event_type not in event_types:
+                event_types[event_type] = []
+            event_types[event_type].append(event["epoch"])
+        
+        # Plot event timeline
+        y_offset = 0
+        for event_type, epochs in event_types.items():
+            axes[1, 0].scatter(epochs, [y_offset] * len(epochs), 
+                              label=event_type, s=50, alpha=0.7)
+            y_offset += 1
+        
+        axes[1, 0].set_xlabel("Epoch")
+        axes[1, 0].set_ylabel("Event Type")
+        axes[1, 0].set_title("Curriculum Learning Events")
+        axes[1, 0].legend()
+        axes[1, 0].grid(True, alpha=0.3)
+    else:
+        axes[1, 0].text(0.5, 0.5, "No curriculum events recorded", 
+                       ha='center', va='center', transform=axes[1, 0].transAxes)
+        axes[1, 0].set_title("Curriculum Learning Events")
+    
+    # Plot 4: Stage performance comparison
+    stage_names = ["stage1", "stage2", "stage3"]
+    stage_performance = {}
+    
+    for stage_name in stage_names:
+        if stage_name in history and isinstance(history[stage_name], dict):
+            stage_data = history[stage_name]
+            if "val_loss" in stage_data and stage_data["val_loss"]:
+                stage_performance[stage_name] = {
+                    "final_loss": stage_data["val_loss"][-1],
+                    "best_loss": min(stage_data["val_loss"]),
+                    "epochs": len(stage_data["val_loss"])
+                }
+    
+    if stage_performance:
+        stages = list(stage_performance.keys())
+        final_losses = [stage_performance[s]["final_loss"] for s in stages]
+        best_losses = [stage_performance[s]["best_loss"] for s in stages]
+        
+        x = np.arange(len(stages))
+        width = 0.35
+        
+        axes[1, 1].bar(x - width/2, final_losses, width, label='Final Loss', alpha=0.8)
+        axes[1, 1].bar(x + width/2, best_losses, width, label='Best Loss', alpha=0.8)
+        
+        axes[1, 1].set_xlabel("Training Stage")
+        axes[1, 1].set_ylabel("Validation Loss")
+        axes[1, 1].set_title("Stage Performance Comparison")
+        axes[1, 1].set_xticks(x)
+        axes[1, 1].set_xticklabels([s.upper() for s in stages])
+        axes[1, 1].legend()
+        axes[1, 1].grid(True, alpha=0.3)
+        
+        # Add epoch count annotations
+        for i, stage in enumerate(stages):
+            epochs = stage_performance[stage]["epochs"]
+            axes[1, 1].text(i, max(final_losses) * 0.9, f'{epochs} epochs', 
+                           ha='center', va='bottom', fontsize=9)
+    else:
+        axes[1, 1].text(0.5, 0.5, "No stage performance data", 
+                       ha='center', va='center', transform=axes[1, 1].transAxes)
+        axes[1, 1].set_title("Stage Performance Comparison")
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close()
+    
+    print(f"Curriculum analysis saved to {save_path}")
 
 
 def visualize_predictions(image, predictions, targets=None, save_path=None):

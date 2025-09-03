@@ -8,6 +8,7 @@ import torch
 import torch.nn.utils
 import time
 import numpy as np
+import random
 from pathlib import Path
 from tqdm import tqdm
 from typing import Dict, List, Optional, Tuple
@@ -98,6 +99,9 @@ class AdaptiveMultiStageTrainer:
     - Cross-modal latent consistency learning
     - Graph-based topology constraints
     """
+    
+    # Class constant for rolling checkpoint path
+    ROLLING_CHECKPOINT = "latest_checkpoint.pth"
 
     def __init__(self, model, train_loader, val_loader, device=None, config=None):
         if config is None:
@@ -169,10 +173,11 @@ class AdaptiveMultiStageTrainer:
             )
 
         # Enhanced loss function with dynamic weighting
+        base_loss_kwargs = {k: v for k, v in DEFAULT_LOSS_CONFIG.__dict__.items() if k != "enable_dynamic_weighting"}
         self.loss_fn = ResearchGradeLoss(
-            **DEFAULT_LOSS_CONFIG.__dict__,
-            enable_dynamic_weighting=config.curriculum.use_gradnorm,
-            gradnorm_alpha=config.curriculum.gradnorm_alpha,
+            **base_loss_kwargs,
+            enable_dynamic_weighting=bool(config.curriculum.use_gradnorm),
+            gradnorm_alpha=float(config.curriculum.gradnorm_alpha),
             device=self.device
         )
 
@@ -411,15 +416,19 @@ class AdaptiveMultiStageTrainer:
 
         self.current_stage = stage
         self.stage_start_time = time.time()
-        self.epoch_times = []
-        self.stage_epoch = 0
+
+        # Only reset if not resuming
+        if not hasattr(self, "epoch_times") or self.epoch_times is None:
+            self.epoch_times = []
+
+        start_epoch = int(self.stage_epoch or 0)
 
         # Set parameter gradients for current stage
         self._configure_stage_parameters(stage)
 
         mode_name = f"stage{stage}"
         
-        for epoch in range(max_epochs):
+        for epoch in range(start_epoch, max_epochs):
             epoch_start_time = time.time()
             self.stage_epoch = epoch
             self.global_epoch += 1
@@ -549,7 +558,7 @@ class AdaptiveMultiStageTrainer:
             print(f"Plateau: {plateau_epochs} epochs without improvement")
 
     def _save_rolling_checkpoint(self):
-        """Enhanced checkpoint saving with curriculum state"""
+        """Enhanced checkpoint saving with curriculum state and RNG state"""
         checkpoint = {
             "model_state_dict": self.model.state_dict(),
             "optimizer_2d_state_dict": self.optimizer_2d.state_dict(),
@@ -575,15 +584,21 @@ class AdaptiveMultiStageTrainer:
                 "epochs_without_improvement": self.curriculum_state.epochs_without_improvement,
                 "best_val_loss": self.curriculum_state.best_val_loss,
                 "stage_transition_epochs": self.curriculum_state.stage_transition_epochs
+            },
+            "rng_state": {
+                "torch": torch.get_rng_state(),
+                "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+                "numpy": np.random.get_state(),
+                "python": random.getstate(),
             }
         }
         
-        checkpoint_path = "latest_checkpoint.pth"
+        checkpoint_path = self.ROLLING_CHECKPOINT
         torch.save(checkpoint, checkpoint_path)
         print(f"Rolling checkpoint saved: {checkpoint_path}")
 
     def load_checkpoint(self, filename):
-        """Enhanced checkpoint loading with curriculum state restoration"""
+        """Enhanced checkpoint loading with curriculum state restoration and device handling"""
         checkpoint = torch.load(filename, map_location=self.device)
         
         self.model.load_state_dict(checkpoint["model_state_dict"])
@@ -591,13 +606,25 @@ class AdaptiveMultiStageTrainer:
         self.optimizer_dvx.load_state_dict(checkpoint["optimizer_dvx_state_dict"])
         self.optimizer_full.load_state_dict(checkpoint["optimizer_full_state_dict"])
         
-        if "scheduler_2d_state_dict" in checkpoint:
-            self.scheduler_2d.load_state_dict(checkpoint["scheduler_2d_state_dict"])
-            self.scheduler_dvx.load_state_dict(checkpoint["scheduler_dvx_state_dict"])
-            self.scheduler_full.load_state_dict(checkpoint["scheduler_full_state_dict"])
+        # Safer scheduler loading
+        for sched_key, sched_obj in [
+            ("scheduler_2d_state_dict", self.scheduler_2d),
+            ("scheduler_dvx_state_dict", self.scheduler_dvx),
+            ("scheduler_full_state_dict", self.scheduler_full),
+        ]:
+            if sched_key in checkpoint:
+                sched_obj.load_state_dict(checkpoint[sched_key])
         
+        # Load loss weights with proper device handling
         if "loss_fn_state" in checkpoint:
-            self.loss_fn.weights = checkpoint["loss_fn_state"]["weights"]
+            loaded_weights = checkpoint["loss_fn_state"]["weights"]
+            if isinstance(loaded_weights, dict):
+                self.loss_fn.weights = {
+                    k: (v.to(self.device) if torch.is_tensor(v) else v)
+                    for k, v in loaded_weights.items()
+                }
+            else:
+                self.loss_fn.weights = loaded_weights
             self.loss_fn.initial_weights = checkpoint["loss_fn_state"]["initial_weights"]
         
         if "history" in checkpoint:
@@ -626,8 +653,30 @@ class AdaptiveMultiStageTrainer:
             self.curriculum_state.best_val_loss = cs.get("best_val_loss", float('inf'))
             self.curriculum_state.stage_transition_epochs = cs.get("stage_transition_epochs", [])
         
+        # Restore RNG states
+        if "rng_state" in checkpoint:
+            torch.set_rng_state(checkpoint["rng_state"]["torch"])
+            if torch.cuda.is_available() and checkpoint["rng_state"]["cuda"] is not None:
+                torch.cuda.set_rng_state_all(checkpoint["rng_state"]["cuda"])
+            np.random.set_state(checkpoint["rng_state"]["numpy"])
+            random.setstate(checkpoint["rng_state"]["python"])
+        
+        # Restore DataLoader sampler states if available
+        if "dataloader_state" in checkpoint:
+            dl_state = checkpoint["dataloader_state"]
+            if dl_state["train_sampler_state"] is not None and hasattr(self.train_loader.sampler, '__dict__'):
+                try:
+                    self.train_loader.sampler.__dict__.update(dl_state["train_sampler_state"])
+                except Exception:
+                    print("Warning: Could not restore train_loader sampler state")
+            if dl_state["val_sampler_state"] is not None and hasattr(self.val_loader.sampler, '__dict__'):
+                try:
+                    self.val_loader.sampler.__dict__.update(dl_state["val_sampler_state"])
+                except Exception:
+                    print("Warning: Could not restore val_loader sampler state")
+        
         print(f"Checkpoint loaded: {filename}")
-        print(f"Resuming from Stage {self.current_stage}, Global Epoch {self.global_epoch + 1}")
+        print(f"Resuming from Stage {self.current_stage}, Global Epoch {self.global_epoch}")
         print(f"Curriculum state restored with {self.curriculum_state.epochs_without_improvement} epochs without improvement")
 
     def train_all_stages(self):
@@ -636,12 +685,10 @@ class AdaptiveMultiStageTrainer:
         
         This is the main entry point that orchestrates the dynamic curriculum learning
         """
-        checkpoint_path = "latest_checkpoint.pth"
-        
-        if Path(checkpoint_path).exists():
-            print(f"Found existing checkpoint: {checkpoint_path}")
+        if Path(self.ROLLING_CHECKPOINT).exists():
+            print(f"Found existing checkpoint: {self.ROLLING_CHECKPOINT}")
             print("Resuming adaptive training from checkpoint...")
-            self.load_checkpoint(checkpoint_path)
+            self.load_checkpoint(self.ROLLING_CHECKPOINT)
         else:
             print("Starting fresh adaptive training pipeline...")
             self.current_stage = 1
@@ -703,9 +750,9 @@ class AdaptiveMultiStageTrainer:
         self._save_checkpoint("final_adaptive_model.pth")
 
         # Clean up rolling checkpoint
-        if Path(checkpoint_path).exists():
-            Path(checkpoint_path).unlink()
-            print(f"Cleaned up rolling checkpoint: {checkpoint_path}")
+        if Path(self.ROLLING_CHECKPOINT).exists():
+            Path(self.ROLLING_CHECKPOINT).unlink()
+            print(f"Cleaned up rolling checkpoint: {self.ROLLING_CHECKPOINT}")
         
         return self.history
 
