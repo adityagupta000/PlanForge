@@ -223,56 +223,53 @@ class ResearchGradeLoss(nn.Module):
         for key, value in new_weights.items():
             if key in self.weights:
                 self.weights[key] = float(value)
-    
+
     def forward(self, predictions: dict, targets: dict, shared_parameters=None):
         """
-        Compute multi-task loss with dynamic weighting
+        Compute multi-task loss with dynamic weighting.
+        GradNorm is applied only to differentiable losses.
+        Non-differentiable losses (graph, polygon, topology, etc.)
+        are included with their static/curriculum weights.
         """
         device = self._get_device_from_inputs(predictions, targets)
         losses = {}
         total_loss = torch.tensor(0.0, device=device)
 
         # ---- 1) Traditional losses ----
-        # Segmentation
         if "segmentation" in predictions and "mask" in targets:
             seg_pred = predictions["segmentation"]
             seg_target = targets["mask"].long()
 
             ce_loss = self.ce_loss(seg_pred, seg_target)
             losses["ce"] = ce_loss
-            losses["seg"] = ce_loss  # Alias for dynamic weighting
-            
+            losses["seg"] = ce_loss  # alias for dynamic weighting
+
             dice_loss = self._dice_loss(seg_pred, seg_target)
             losses["dice"] = dice_loss
 
-        # SDF loss
         if "sdf" in predictions and "mask" in targets:
             sdf_pred = predictions["sdf"]
             sdf_target = self._mask_to_sdf(targets["mask"])
             sdf_target = sdf_target.to(sdf_pred.device).type_as(sdf_pred)
             losses["sdf"] = self.mse_loss(sdf_pred, sdf_target)
 
-        # Attribute regression
         if "attributes" in predictions and "attributes" in targets:
             pred_attr = predictions["attributes"].float()
             tgt_attr = targets["attributes"].float().to(pred_attr.device)
             losses["attr"] = self.l1_loss(pred_attr, tgt_attr)
 
-        # Polygon / DVX losses
         if "polygons" in predictions and "polygons_gt" in targets:
             losses["polygon"] = self._polygon_loss(predictions, targets["polygons_gt"])
 
-        # 3D voxel IoU loss
         if "voxels_pred" in predictions and "voxels_gt" in targets:
             pred_vox = predictions["voxels_pred"].float()
             tgt_vox = targets["voxels_gt"].float().to(pred_vox.device)
             losses["voxel"] = self._voxel_iou_loss(pred_vox, tgt_vox)
 
-        # Traditional topology loss
         if "segmentation" in predictions:
             losses["topology"] = self._topology_loss(predictions["segmentation"])
 
-        # ---- 2) NEW: Cross-modal latent consistency ----
+        # ---- 2) Cross-modal latent consistency ----
         if ("features" in predictions and "voxels_gt" in targets and 
             "latent_2d_embedding" in predictions and "latent_3d_embedding" in predictions):
             consistency_loss = self._latent_consistency_loss(
@@ -281,26 +278,31 @@ class ResearchGradeLoss(nn.Module):
             )
             losses["latent_consistency"] = consistency_loss
 
-        # ---- 3) NEW: Graph-based topology constraints ----
+        # ---- 3) Graph-based topology constraints ----
         if "segmentation" in predictions:
             graph_loss = self._graph_topology_loss(predictions["segmentation"])
             losses["graph"] = graph_loss
 
-        # ---- 4) Apply dynamic weighting ----
+        # ---- 4) Apply weighting ----
         if self.enable_dynamic_weighting and shared_parameters is not None:
-            # Update weights using GradNorm
-            task_losses = {name: loss for name, loss in losses.items() 
-                          if name in self.weights}
-            dynamic_weights = self.loss_weighter.update_weights(
-                task_losses, shared_parameters
-            )
-            # Use dynamic weights
+            # only include differentiable losses for GradNorm
+            task_losses = {
+                name: loss for name, loss in losses.items()
+                if name in self.weights and isinstance(loss, torch.Tensor) and loss.requires_grad
+            }
+
+            dynamic_weights = self.loss_weighter.update_weights(task_losses, shared_parameters)
+
+            # apply weights (dynamic for diff losses, static for non-diff losses)
             for name, loss in losses.items():
-                if name in dynamic_weights:
-                    weight = dynamic_weights[name].item()
+                if name in self.weights:
+                    if name in dynamic_weights:
+                        weight = dynamic_weights[name].item()
+                    else:
+                        weight = self.weights[name]
                     total_loss = total_loss + weight * loss
         else:
-            # Use static/curriculum weights
+            # static weights
             for name, loss in losses.items():
                 if name in self.weights:
                     total_loss = total_loss + self.weights[name] * loss
