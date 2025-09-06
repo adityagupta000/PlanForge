@@ -1,5 +1,6 @@
 """
 Dataset classes for the Neural-Geometric 3D Model Generator
+Enhanced with in-memory caching for faster training
 """
 
 import cv2
@@ -9,6 +10,7 @@ import torch
 from torch.utils.data import Dataset
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Union
+import time
 
 from config import DEFAULT_DATA_CONFIG
 
@@ -20,6 +22,8 @@ class AdvancedFloorPlanDataset(Dataset):
     - Attribute dictionary (geometric parameters)
     - Ground-truth mesh + voxelized occupancy
     - Polygon outlines for vectorization supervision
+    
+    Enhanced with optional in-memory caching for performance
     """
 
     def __init__(
@@ -46,6 +50,115 @@ class AdvancedFloorPlanDataset(Dataset):
         # Collect all samples that contain every required file
         self.samples = self._find_complete_samples()
         print(f"Found {len(self.samples)} complete samples for {split}")
+
+        # NEW: In-memory caching for performance
+        self.cache_in_memory = getattr(config, "cache_in_memory", False)
+        self._cache = None
+        
+        if self.cache_in_memory and len(self.samples) > 0:
+            print(f"[DATA] Preloading {len(self.samples)} samples into RAM (cache_in_memory=True).")
+            print("[DATA] This may take significant memory but will speed up training...")
+            
+            # Estimate memory usage
+            estimated_mb = self._estimate_memory_usage()
+            print(f"[DATA] Estimated memory usage: {estimated_mb:.1f} MB")
+            
+            start_time = time.time()
+            self._preload_cache()
+            load_time = time.time() - start_time
+            print(f"[DATA] Cache preloading completed in {load_time:.2f}s")
+
+    def _estimate_memory_usage(self):
+        """Estimate memory usage for caching"""
+        if not self.samples:
+            return 0.0
+        
+        H, W = self.image_size
+        n_samples = len(self.samples)
+        
+        # Rough estimates in bytes
+        image_bytes = H * W * 3  # RGB uint8
+        mask_bytes = H * W  # grayscale uint8  
+        voxel_bytes = self.voxel_size ** 3 * 4  # float32
+        json_bytes = 1024  # rough estimate for params + polygons
+        
+        total_per_sample = image_bytes + mask_bytes + voxel_bytes + json_bytes
+        total_mb = (total_per_sample * n_samples) / (1024 * 1024)
+        
+        return total_mb
+
+    def _preload_cache(self):
+        """Preload all samples into memory"""
+        self._cache = []
+        
+        for i, sample in enumerate(self.samples):
+            if i % 100 == 0:
+                print(f"[DATA] Loading sample {i+1}/{len(self.samples)}")
+                
+            try:
+                # Load image
+                img = cv2.imread(str(sample["image"]))
+                if img is None:
+                    print(f"Warning: Could not load image {sample['image']}")
+                    continue
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                img = cv2.resize(img, self.image_size)  # (W, H) format for cv2.resize
+                
+                # Load mask
+                mask = cv2.imread(str(sample["mask"]), cv2.IMREAD_GRAYSCALE)
+                if mask is None:
+                    print(f"Warning: Could not load mask {sample['mask']}")
+                    continue
+                mask = cv2.resize(mask, self.image_size, interpolation=cv2.INTER_NEAREST)
+                
+                # Load voxel data
+                try:
+                    voxel_data = np.load(sample["voxel"])
+                    vox = voxel_data["voxels"]  # Keep as numpy array
+                except Exception as e:
+                    print(f"Warning: Could not load voxel data {sample['voxel']}: {e}")
+                    # Create dummy voxel data
+                    vox = np.zeros((self.voxel_size, self.voxel_size, self.voxel_size), dtype=np.float32)
+                
+                # Load parameters
+                try:
+                    with open(sample["params"], "r") as f:
+                        params = json.load(f)
+                except Exception as e:
+                    print(f"Warning: Could not load params {sample['params']}: {e}")
+                    params = self._get_default_attributes()
+                
+                # Load polygons
+                try:
+                    with open(sample["polygon"], "r") as f:
+                        polygons = json.load(f)
+                except Exception as e:
+                    print(f"Warning: Could not load polygons {sample['polygon']}: {e}")
+                    polygons = {"walls": []}
+                
+                self._cache.append({
+                    "image": img,
+                    "mask": mask,
+                    "vox": vox,
+                    "params": params,
+                    "polygons": polygons,
+                    "sample_id": sample["image"].parent.name,
+                })
+                
+            except Exception as e:
+                print(f"Error loading sample {i}: {e}")
+                continue
+
+    def _get_default_attributes(self):
+        """Return default attributes for missing param files"""
+        return {
+            "wall_height": 2.6,
+            "wall_thickness": 0.15,
+            "window_base_height": 0.7,
+            "window_height": 0.95,
+            "door_height": 2.6,
+            "pixel_scale": 0.02,
+        }
 
     # ----------------------------------------------------------------------
     def _find_complete_samples(self):
@@ -77,42 +190,60 @@ class AdvancedFloorPlanDataset(Dataset):
 
     # ----------------------------------------------------------------------
     def __len__(self):
-        return len(self.samples)
+        return len(self._cache) if self._cache is not None else len(self.samples)
 
     # ----------------------------------------------------------------------
     def __getitem__(self, idx):
-        sample = self.samples[idx]
+        # Use cached data if available
+        if self._cache is not None:
+            cached_sample = self._cache[idx]
+            image = cached_sample['image']
+            mask = cached_sample['mask']
+            vox = cached_sample['vox']
+            attributes = cached_sample['params']
+            polygons_gt = cached_sample['polygons']
+            sample_id = cached_sample['sample_id']
+        else:
+            # Fallback: load from disk on-the-fly
+            sample = self.samples[idx]
+            
+            # Load image and mask
+            image = cv2.imread(str(sample["image"]))
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            image = cv2.resize(image, self.image_size)
+            
+            mask = cv2.imread(str(sample["mask"]), cv2.IMREAD_GRAYSCALE)
+            mask = cv2.resize(mask, self.image_size, interpolation=cv2.INTER_NEAREST)
+            
+            # Load attributes
+            with open(sample["params"], "r") as f:
+                attributes = json.load(f)
 
-        # Load image and mask
-        image = cv2.imread(str(sample["image"]))
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        image = cv2.resize(image, self.image_size) / 255.0
+            # Load voxel ground truth
+            voxel_data = np.load(sample["voxel"])
+            vox = voxel_data["voxels"]
 
-        mask = cv2.imread(str(sample["mask"]), cv2.IMREAD_GRAYSCALE)
-        mask = cv2.resize(mask, self.image_size, interpolation=cv2.INTER_NEAREST)
+            # Load polygon ground truth
+            with open(sample["polygon"], "r") as f:
+                polygons_gt = json.load(f)
+            
+            sample_id = sample["image"].parent.name
 
+        # Normalize image to [0,1]
+        image = image.astype(np.float32) / 255.0
+        
+        # Clean mask (remove class 5 if present)
         mask[mask == 5] = 0
-
-        # Load attributes
-        with open(sample["params"], "r") as f:
-            attributes = json.load(f)
-
-        # Load voxel ground truth
-        voxel_data = np.load(sample["voxel"])
-        voxels_gt = voxel_data["voxels"]
-
-        # Load polygon ground truth
-        with open(sample["polygon"], "r") as f:
-            polygons_gt = json.load(f)
 
         # Convert to tensors
         image_tensor = torch.from_numpy(image).float().permute(2, 0, 1)
         mask_tensor = torch.from_numpy(mask).long()
-        voxels_tensor = torch.from_numpy(voxels_gt.astype(np.float32))
+        voxels_tensor = torch.from_numpy(vox.astype(np.float32))
 
         attr_tensor = self._process_attributes(attributes)
         polygon_tensor = self._process_polygons(polygons_gt)
 
+        # Apply augmentation if enabled
         if self.augment:
             image_tensor, mask_tensor = self._augment(image_tensor, mask_tensor)
 
@@ -122,7 +253,7 @@ class AdvancedFloorPlanDataset(Dataset):
             "attributes": attr_tensor,
             "voxels_gt": voxels_tensor,
             "polygons_gt": polygon_tensor,
-            "sample_id": sample["image"].parent.name,
+            "sample_id": sample_id,
         }
 
     # ----------------------------------------------------------------------
@@ -199,8 +330,8 @@ class AdvancedFloorPlanDataset(Dataset):
 
     # ----------------------------------------------------------------------
     def _augment(self, image, mask):
-        """Simple data augmentation with rotations and flips."""
-        # Random rotation (multiples of 90° only)
+        """Enhanced data augmentation with rotations, flips, and intensity changes."""
+        # Random rotation (multiples of 90° only for architectural data)
         if torch.rand(1) < 0.5:
             k = torch.randint(1, 4, (1,)).item()
             image = torch.rot90(image, k, dims=[1, 2])
@@ -211,7 +342,43 @@ class AdvancedFloorPlanDataset(Dataset):
             image = torch.flip(image, dims=[2])
             mask = torch.flip(mask, dims=[1])
 
+        # Random vertical flip
+        if torch.rand(1) < 0.5:
+            image = torch.flip(image, dims=[1])
+            mask = torch.flip(mask, dims=[0])
+
+        # Slight brightness/contrast adjustment
+        if torch.rand(1) < 0.3:
+            brightness = torch.rand(1) * 0.2 - 0.1  # ±0.1
+            contrast = torch.rand(1) * 0.2 + 0.9     # 0.9-1.1
+            image = torch.clamp(image * contrast + brightness, 0, 1)
+
         return image, mask
+
+    # ----------------------------------------------------------------------
+    def get_cache_info(self):
+        """Return information about caching status"""
+        return {
+            "cache_enabled": self.cache_in_memory,
+            "cache_loaded": self._cache is not None,
+            "cached_samples": len(self._cache) if self._cache else 0,
+            "total_samples": len(self.samples),
+            "estimated_memory_mb": self._estimate_memory_usage() if self.cache_in_memory else 0
+        }
+
+    def disable_cache(self):
+        """Disable caching and free memory"""
+        if self._cache is not None:
+            print(f"[DATA] Disabling cache and freeing memory for {len(self._cache)} samples")
+            self._cache = None
+            self.cache_in_memory = False
+
+    def enable_cache(self):
+        """Enable caching if not already enabled"""
+        if not self.cache_in_memory and self.samples:
+            self.cache_in_memory = True
+            print("[DATA] Enabling cache...")
+            self._preload_cache()
 
 
 # ======================================================================
@@ -249,3 +416,45 @@ def create_synthetic_data_sample():
     polygons = {"walls": [{"points": room_points.tolist()}]}
 
     return image, mask, attributes, voxels, polygons
+
+
+class SyntheticFloorPlanDataset(Dataset):
+    """
+    Synthetic dataset for testing and development when real data is not available
+    """
+    
+    def __init__(self, num_samples=1000, image_size=(256, 256), voxel_size=64):
+        self.num_samples = num_samples
+        self.image_size = image_size
+        self.voxel_size = voxel_size
+    
+    def __len__(self):
+        return self.num_samples
+    
+    def __getitem__(self, idx):
+        # Generate deterministic synthetic data based on index
+        np.random.seed(idx)
+        torch.manual_seed(idx)
+        
+        image, mask, attributes, voxels, polygons_gt = create_synthetic_data_sample()
+        
+        # Convert to tensors
+        image_tensor = torch.from_numpy(image.astype(np.float32) / 255.0).permute(2, 0, 1)
+        mask_tensor = torch.from_numpy(mask).long()
+        voxels_tensor = torch.from_numpy(voxels.astype(np.float32))
+        
+        # Process attributes and polygons using same methods as main dataset
+        dataset = AdvancedFloorPlanDataset.__new__(AdvancedFloorPlanDataset)
+        dataset.image_size = self.image_size
+        
+        attr_tensor = dataset._process_attributes(attributes)
+        polygon_tensor = dataset._process_polygons(polygons_gt)
+        
+        return {
+            "image": image_tensor,
+            "mask": mask_tensor,
+            "attributes": attr_tensor,
+            "voxels_gt": voxels_tensor,
+            "polygons_gt": polygon_tensor,
+            "sample_id": f"synthetic_{idx:06d}",
+        }

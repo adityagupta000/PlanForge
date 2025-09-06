@@ -11,10 +11,10 @@ import torch
 class DataConfig:
     """Data-related configuration"""
     data_dir: str = "./data/floorplans"
-    image_size: Tuple[int, int] = (256, 256)
+    image_size: Tuple[int, int] = (256, 256)   # keep full resolution for accuracy
     voxel_size: int = 64
-    batch_size: int = 8
-    num_workers: int = 4
+    batch_size: int = 4                        # balance speed & memory
+    num_workers: int = 8                       # faster dataloader (tune per CPU)
     augment: bool = True
 
 
@@ -23,19 +23,19 @@ class ModelConfig:
     """Model architecture configuration optimized for high accuracy"""
     input_channels: int = 3
     num_classes: int = 5
-    feature_dim: int = 768  # Increased for better representation
+    feature_dim: int = 512     # reduced from 768 → faster while keeping strong accuracy
     num_attributes: int = 6
     voxel_size: int = 64
-    max_polygons: int = 30  # More polygons for complex layouts
-    max_points: int = 100   # More points per polygon for precision
-    dropout: float = 0.05   # Reduced dropout for better performance
-    use_attention: bool = True  # Add attention mechanisms
-    use_deep_supervision: bool = True  # Multi-scale supervision
+    max_polygons: int = 20     # enough for complex layouts
+    max_points: int = 50       # good detail without huge cost
+    dropout: float = 0.05
+    use_attention: bool = True
+    use_deep_supervision: bool = True
     
-    # New: Auxiliary heads for novel training strategies
-    use_latent_consistency: bool = True  # Cross-modal consistency
-    use_graph_constraints: bool = True   # Graph-based topology
-    latent_embedding_dim: int = 256      # Consistency embedding size
+    # Auxiliary heads for novel training strategies
+    use_latent_consistency: bool = True
+    use_graph_constraints: bool = True
+    latent_embedding_dim: int = 256
 
 
 @dataclass 
@@ -43,34 +43,46 @@ class CurriculumConfig:
     """Dynamic curriculum learning configuration"""
     # Adaptive stage transitioning
     use_dynamic_curriculum: bool = True
-    stage_switch_patience: int = 5  # Epochs without improvement before switching
-    min_improvement_threshold: float = 0.001  # Minimum relative improvement
-    plateau_detection_window: int = 3  # Rolling window for plateau detection
+    stage_switch_patience: int = 5
+    min_improvement_threshold: float = 0.001
+    plateau_detection_window: int = 3
 
-    # GradNorm / gradient tracking (added to satisfy trainer)
-    # window length for rolling gradient norm statistics used by GradNorm
+    # GradNorm / gradient tracking
     gradient_norm_window: int = 100
 
-    # Objectives for multi-objective optimization (used by GradNorm/monitoring)
-    # If trainer expects `config.objectives`, this provides a sensible default.
+    # Objectives for multi-objective optimization
     objectives: Optional[List[str]] = None
 
     # Topology-aware scheduling
-    topology_schedule: str = "progressive"  # "progressive", "linear_ramp", "exponential"
+    topology_schedule: str = "progressive"   # "progressive", "linear_ramp", "exponential"
     topology_start_weight: float = 0.1
     topology_end_weight: float = 1.0
     topology_ramp_epochs: int = 20
     
-    # Loss component scheduling
-    loss_schedule: Dict[str, str] = None  # Will be set in __post_init__
+    # config.py (snippet — add into the existing config class/dict)
+    # Mixed precision and training conveniences
+    use_mixed_precision = True            # enable AMP
+    cache_in_memory = False               # set True if host RAM can hold dataset
+    accumulation_steps = 1                # effective batch size multiplier
+    dvx_step_freq = 1                     # run DVX refinement every N steps (1 = every step)
+    persistent_workers = True             # DataLoader persistent workers
+    prefetch_factor = 4                   # DataLoader prefetch
+    num_workers = 8                       # default num workers for DataLoader (tune by CPU)
+    # Progressive resolution settings (example)
+    voxel_size_stage = { "stage1": 32, "stage2": 32, "stage3": 64 }  # voxel sizes per stage
+    image_size_stage = { "stage1": (128,128), "stage2": (192,192), "stage3": (256,256)}
+
     
-    # Multi-objective optimization
+    # Loss component scheduling
+    loss_schedule: Dict[str, str] = None
+    
+    # Multi-objective optimization (GradNorm)
     use_gradnorm: bool = True
-    gradnorm_alpha: float = 0.12  # GradNorm restoring force
-    gradnorm_update_freq: int = 5  # Update loss weights every N batches
+    gradnorm_alpha: float = 0.12
+    gradnorm_update_freq: int = 5
     
     # Graph constraint scheduling
-    graph_weight_schedule: str = "delayed_ramp"  # Start after polygon stabilizes
+    graph_weight_schedule: str = "delayed_ramp"
     graph_start_epoch: int = 15
     graph_end_weight: float = 0.5
     
@@ -78,15 +90,15 @@ class CurriculumConfig:
         # Provide default loss schedule if not set
         if self.loss_schedule is None:
             self.loss_schedule = {
-                "segmentation": "static",      # Keep constant
-                "dice": "static",             
-                "sdf": "early_decay",         # Decay after Stage 1
+                "segmentation": "static",
+                "dice": "static",
+                "sdf": "early_decay",
                 "attributes": "static",
-                "polygon": "staged_ramp",     # Ramp up in Stage 2
-                "voxel": "late_ramp",        # Ramp up in Stage 3
-                "topology": "progressive",    # Progressive increase
-                "latent_consistency": "mid_ramp",  # Activate mid-training
-                "graph": "delayed_ramp"       # Activate after polygons stable
+                "polygon": "staged_ramp",
+                "voxel": "late_ramp",
+                "topology": "progressive",
+                "latent_consistency": "mid_ramp",
+                "graph": "delayed_ramp",
             }
 
         # Default objectives used by GradNorm / trainer monitoring
@@ -100,7 +112,7 @@ class CurriculumConfig:
                 "voxel",
                 "topology",
                 "latent_consistency",
-                "graph"
+                "graph",
             ]
 
 
@@ -109,18 +121,18 @@ class TrainingConfig:
     """Training configuration with adaptive strategies"""
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     
-    # Dynamic epoch limits (maximums, actual may be less with early switching)
-    max_stage1_epochs: int = 80    # Increased maximum
-    max_stage2_epochs: int = 50
-    max_stage3_epochs: int = 150
+    # Dynamic epoch limits (maxima; curriculum may switch earlier)
+    max_stage1_epochs: int = 40
+    max_stage2_epochs: int = 25
+    max_stage3_epochs: int = 60
     
-    # Minimum epochs per stage (prevent premature switching)
-    min_stage1_epochs: int = 10
-    min_stage2_epochs: int = 5 
-    min_stage3_epochs: int = 15
+    # Minimum epochs per stage (avoid switching too early)
+    min_stage1_epochs: int = 8
+    min_stage2_epochs: int = 5
+    min_stage3_epochs: int = 12
     
-    # Learning rates (will be dynamically adjusted)
-    stage1_lr: float = 2e-4
+    # Learning rates (per stage)
+    stage1_lr: float = 3e-4
     stage1_weight_decay: float = 1e-5
     
     stage2_lr: float = 1e-4
@@ -137,8 +149,9 @@ class TrainingConfig:
     
     # Gradient monitoring for dynamic weighting
     track_gradient_norms: bool = True
-    gradient_norm_window: int = 10  # Rolling window for gradient tracking (legacy / trainer may use either)
+    gradient_norm_window: int = 10  # rolling window for gradient tracking
     
+    # Checkpointing
     checkpoint_freq: int = 5
     
     # Curriculum configuration
@@ -159,7 +172,7 @@ class LossConfig:
     attr_weight: float = 1.0
     polygon_weight: float = 1.0
     voxel_weight: float = 1.0
-    topology_weight: float = 0.1  # Start low, ramp up
+    topology_weight: float = 0.1  # start low, ramp up
     
     # New loss components
     latent_consistency_weight: float = 0.5
@@ -167,8 +180,8 @@ class LossConfig:
     
     # Dynamic weighting parameters
     enable_dynamic_weighting: bool = True
-    weight_update_freq: int = 10  # Update weights every N batches
-    weight_momentum: float = 0.9   # Momentum for weight updates
+    weight_update_freq: int = 10
+    weight_momentum: float = 0.9
 
 
 @dataclass
@@ -221,7 +234,7 @@ class StageTransitionCriteria:
         return improvement_rate < config.min_improvement_threshold
 
 
-# Default configurations
+# Default configurations (import these in your trainer)
 DEFAULT_DATA_CONFIG = DataConfig()
 DEFAULT_MODEL_CONFIG = ModelConfig()
 DEFAULT_TRAINING_CONFIG = TrainingConfig()

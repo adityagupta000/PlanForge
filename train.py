@@ -25,33 +25,6 @@ from config import (
 )
 
 
-"""
-Enhanced training script for the Neural-Geometric 3D Model Generator
-Implements novel training strategies: dynamic curriculum, adaptive weighting, cross-modal consistency
-"""
-
-import argparse
-import torch
-from torch.utils.data import DataLoader
-from pathlib import Path
-import json
-import matplotlib.pyplot as plt
-import numpy as np
-
-from dataset import AdvancedFloorPlanDataset
-from models.model import NeuralGeometric3DGenerator
-from training.trainer import AdaptiveMultiStageTrainer, MultiStageTrainer
-from utils.visualization import plot_training_history, plot_curriculum_analysis
-from config import (
-    DEFAULT_DATA_CONFIG, 
-    DEFAULT_MODEL_CONFIG, 
-    DEFAULT_TRAINING_CONFIG,
-    DEFAULT_LOSS_CONFIG,
-    TrainingConfig,
-    CurriculumConfig
-)
-
-
 def create_enhanced_config(args):
     """Create enhanced training configuration with novel strategies"""
     config = TrainingConfig()
@@ -238,7 +211,7 @@ def main():
     # Basic arguments
     parser.add_argument("--data_dir", type=str, default="./data/floorplans", 
                        help="Path to dataset directory")
-    parser.add_argument("--batch_size", type=int, default=8, help="Batch size")
+    parser.add_argument("--batch_size", type=int, default=2, help="Batch size")
     parser.add_argument("--num_workers", type=int, default=4, help="Number of data workers")
     parser.add_argument("--device", type=str, default=None, help="Training device")
     parser.add_argument("--resume", type=str, default=None, help="Resume from checkpoint")
@@ -292,15 +265,24 @@ def main():
     parser.add_argument("--max_points", type=int, default=100, help="Maximum points per polygon")
     
     # Dynamic epoch limits
-    parser.add_argument("--max-stage1-epochs", type=int, default=80, help="Max epochs for Stage 1")
-    parser.add_argument("--max-stage2-epochs", type=int, default=50, help="Max epochs for Stage 2") 
-    parser.add_argument("--max-stage3-epochs", type=int, default=150, help="Max epochs for Stage 3")
+    parser.add_argument("--max-stage1-epochs", type=int, default=50, help="Max epochs for Stage 1")
+    parser.add_argument("--max-stage2-epochs", type=int, default=35, help="Max epochs for Stage 2") 
+    parser.add_argument("--max-stage3-epochs", type=int, default=100, help="Max epochs for Stage 3")
+    
+    parser.add_argument("--persistent_workers",action="store_true",default=False,help="Keep DataLoader workers alive between epochs (requires num_workers > 0).")
+
+    parser.add_argument("--prefetch_factor",type=int,default=2,help="Number of batches preloaded by each worker.")
+
     
     args = parser.parse_args()
 
     # Setup device
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
+    
+    import torch.backends.cudnn as cudnn
+    if device == "cuda":
+        cudnn.benchmark = True
 
     # Create output directory
     output_dir = Path(args.output_dir)
@@ -349,15 +331,21 @@ def main():
         num_workers=args.num_workers,
         pin_memory=True,
         drop_last=True,
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=True,
+        persistent_workers=args.persistent_workers if args.num_workers > 0 else False,
+        prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None
     )
 
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=max(1, args.batch_size),
+        shuffle=False,
+        num_workers=max(1, args.num_workers // 2),
+        pin_memory=True,
+        drop_last=False,
+        persistent_workers=args.persistent_workers if args.num_workers > 0 else False,
+        prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None
+    )
+    
     # Create enhanced model
     print("\nInitializing enhanced model...")
     model = create_enhanced_model(args)

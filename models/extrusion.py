@@ -1,189 +1,327 @@
 """
-Differentiable 3D extrusion module for converting polygons to 3D occupancy
+Vectorized Differentiable 3D extrusion module for converting polygons to 3D occupancy
+Optimized version with GPU-accelerated vectorized operations
 """
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class DifferentiableExtrusion(nn.Module):
     """
-    Differentiable 3D extrusion module
+    Vectorized Differentiable 3D extrusion module
     Converts polygons + attributes to soft 3D occupancy grids
     """
 
     def __init__(self, voxel_size: int = 64):
         super().__init__()
         self.voxel_size = int(voxel_size)
+        # Pre-computed coordinates buffer - will be initialized on first use
+        self.register_buffer("_coords", None)
+
+    def _ensure_coords(self, device):
+        """Initialize or update coordinate grid if needed"""
+        if (self._coords is None or 
+            self._coords.device != device or 
+            self._coords.shape[0] != (self.voxel_size * self.voxel_size)):
+            
+            H = W = self.voxel_size
+            y, x = torch.meshgrid(
+                torch.arange(H, device=device), 
+                torch.arange(W, device=device), 
+                indexing="ij"
+            )
+            coords = torch.stack([x.flatten().float(), y.flatten().float()], dim=1)  # [H*W, 2]
+            # Normalize to 0..1 coords to match polygon coordinates
+            coords = coords / float(self.voxel_size - 1)
+            self.register_buffer("_coords", coords)
+
+    def polygon_sdf(self, polygon_xy):
+        """
+        Compute signed distance field for a polygon using vectorized operations.
+        
+        Args:
+            polygon_xy: [P, 2] polygon vertices in normalized 0..1 coords
+        Returns:
+            sdf: [H*W] signed distances (negative inside, positive outside)
+        """
+        device = polygon_xy.device
+        self._ensure_coords(device)
+        pts = self._coords  # [M, 2], M = H*W
+        P = polygon_xy.shape[0]
+        
+        if P < 2:
+            # Degenerate case: return large positive distances (outside)
+            return torch.full((pts.shape[0],), 1.0, device=device)
+
+        # Create edges: v0->v1, v1->v2, ..., v_{P-1}->v0
+        v0 = polygon_xy.unsqueeze(1)   # [P, 1, 2]
+        v1 = torch.roll(polygon_xy, shifts=-1, dims=0).unsqueeze(1)  # [P, 1, 2]
+        
+        # Expand for broadcasting: edges x points -> [P, M, 2]
+        pts_exp = pts.unsqueeze(0)     # [1, M, 2]
+        
+        # Compute edge vectors and point-to-edge vectors
+        e = v1 - v0                   # [P, 1, 2] edge vectors
+        v = pts_exp - v0              # [P, M, 2] vectors from v0 to each point
+        
+        # Project points onto edges
+        e_norm_sq = (e**2).sum(dim=2, keepdim=True)  # [P, 1, 1]
+        e_norm_sq = e_norm_sq + 1e-8  # Avoid division by zero
+        
+        # Projection parameter t along edge
+        t = (v * e).sum(dim=2, keepdim=True) / e_norm_sq  # [P, M, 1]
+        t_clamped = t.clamp(0.0, 1.0)  # Clamp to line segment
+        
+        # Closest point on each edge
+        proj = v0 + t_clamped * e    # [P, M, 2]
+        diff = pts_exp - proj        # [P, M, 2]
+        dists = torch.norm(diff, dim=2)  # [P, M] distances to each edge
+        
+        # Find minimum distance to any edge
+        min_dist_per_point, _ = dists.min(dim=0)  # [M]
+
+        # Vectorized inside/outside test using ray casting
+        x_pts = pts[:, 0].unsqueeze(0)  # [1, M]
+        y_pts = pts[:, 1].unsqueeze(0)  # [1, M]
+        x0 = v0[..., 0]  # [P, 1]
+        y0 = v0[..., 1]  # [P, 1]
+        x1 = v1[..., 0]  # [P, 1]
+        y1 = v1[..., 1]  # [P, 1]
+
+        # Check if horizontal ray crosses each edge
+        y_crosses = ((y0 <= y_pts) & (y1 > y_pts)) | ((y1 <= y_pts) & (y0 > y_pts))  # [P, M]
+        
+        # Compute x coordinate of intersection with horizontal ray
+        dy = y1 - y0
+        dx = x1 - x0
+        inter_x = x0 + dx * ((y_pts - y0) / (dy + 1e-8))  # [P, M]
+        
+        # Count crossings to the right of each point
+        crossings = (inter_x > x_pts) & y_crosses  # [P, M]
+        crossing_count = crossings.sum(dim=0)  # [M]
+        inside = (crossing_count % 2 == 1)     # [M] boolean - odd number of crossings = inside
+
+        # Create signed distance field: negative inside, positive outside
+        sdf = min_dist_per_point.clone()
+        sdf[inside] = -sdf[inside]
+        return sdf  # [M]
 
     def forward(self, polygons: torch.Tensor, attributes: torch.Tensor, validity_scores: torch.Tensor) -> torch.Tensor:
         """
-        Convert polygons to 3D voxel occupancy.
+        Convert polygons to 3D voxel occupancy using vectorized operations.
 
         Args:
             polygons: [B, N, P, 2] - N polygons, P points each (normalized [0,1])
-            attributes: [B, 6] - geometric parameters (normalized as in dataset)
+            attributes: [B, 6] - geometric parameters (normalized)
             validity_scores: [B, N] - polygon validity scores
         Returns:
             voxels: [B, D, H, W] float tensor in [0,1]
         """
-        batch_size = polygons.shape[0]
         device = polygons.device
+        B, N, P, _ = polygons.shape
+        D = H = W = self.voxel_size
+        M = H * W
 
-        # Build per-sample voxels and stack to avoid in-place writes on a preallocated batched tensor
-        voxels_list = []
-        for b in range(batch_size):
-            vox_b = self._extrude_sample(polygons[b], attributes[b], validity_scores[b])
-            voxels_list.append(vox_b)
+        # Pre-allocate output tensor
+        voxels = torch.zeros((B, D, H, W), device=device)
 
-        return torch.stack(voxels_list, dim=0)  # [B, D, H, W]
-
-    def _extrude_sample(self, polygons: torch.Tensor, attributes: torch.Tensor, validity: torch.Tensor) -> torch.Tensor:
-        """Extrude polygons for a single sample into a [D,H,W] voxel grid."""
-        device = polygons.device
-        D = self.voxel_size
-        H = self.voxel_size
-        W = self.voxel_size
-
-        # Initialize voxel grid (float)
-        voxels = torch.zeros((D, H, W), device=device, dtype=torch.float32)
-
-        # Extract geometric parameters (denormalize same way dataset did)
-        wall_height_m = float(attributes[0].item() * 5.0)          # back to meters
-        # wall_thickness = float(attributes[1].item() * 0.5)      # not used for now
-
-        # Convert wall height (meters) to voxel height
-        height_voxels = min(int((wall_height_m / 5.0) * D), D)
-
-        # Iterate polygons (assume polygons are [N, P, 2], normalized to [0,1])
-        for poly, valid_score in zip(polygons, validity):
-            # skip invalid polygons
-            if valid_score.item() < 0.5:
-                continue
-
-            # If polygon has no points or all zeros, skip
-            if poly.numel() == 0 or torch.all(poly == 0):
-                continue
-
-            # Scale to voxel coordinates (0..voxel_size-1)
-            poly_voxel = poly * float(self.voxel_size - 1)
-
-            # Rasterize polygon to 2D soft mask
-            mask_2d = self._polygon_to_mask(poly_voxel)  # [H, W], float in [0,1]
-
-            # Extrude mask into voxel columns (top-down along depth axis)
-            # Use out-of-place update to preserve autograd history
-            for z in range(0, height_voxels):
-                # clone the target slice before combining to avoid in-place modification
-                target_slice = voxels[z].clone()
-                combined = torch.maximum(target_slice, mask_2d)
-                voxels[z] = combined
+        # Process each sample in batch (still iterate over B for memory efficiency)
+        for b in range(B):
+            sample_vox = torch.zeros((D, H, W), device=device)
+            
+            # Extract wall height for this sample
+            wall_height_normalized = attributes[b, 0].item()  # Assume first attribute is wall height
+            wall_height_m = wall_height_normalized * 5.0     # Denormalize to meters
+            height_voxels = max(1, min(D, int((wall_height_m / 5.0) * D)))
+            
+            # Process each polygon (vectorized per polygon)
+            for n in range(N):
+                # Skip invalid polygons
+                if validity_scores[b, n].item() < 0.5:
+                    continue
+                
+                poly = polygons[b, n]  # [P, 2]
+                
+                # Skip empty or zero polygons
+                if poly.abs().sum().item() == 0:
+                    continue
+                
+                # Remove padding (zero vertices)
+                valid_mask = (poly.sum(dim=1) != 0.0)
+                if valid_mask.sum().item() < 3:  # Need at least 3 vertices
+                    continue
+                
+                valid_poly = poly[valid_mask]  # [P_valid, 2]
+                
+                # Compute signed distance field for this polygon
+                sdf_flat = self.polygon_sdf(valid_poly)  # [M]
+                
+                # Convert SDF to soft mask using sigmoid
+                # Higher multiplier = sharper transition, tune as needed
+                sharpness = 100.0
+                mask2d = torch.sigmoid(-sdf_flat * sharpness)  # [M]
+                mask2d = mask2d.view(H, W)  # [H, W]
+                
+                # Extrude mask to 3D using vectorized operations
+                # Create mask stack for all height levels at once
+                mask_3d = mask2d.unsqueeze(0).expand(height_voxels, -1, -1)  # [height_voxels, H, W]
+                
+                # Update voxel grid (element-wise maximum to handle overlapping polygons)
+                sample_vox[:height_voxels] = torch.maximum(
+                    sample_vox[:height_voxels], 
+                    mask_3d
+                )
+            
+            voxels[b] = sample_vox
 
         return voxels
 
-    def _polygon_to_mask(self, polygon_voxel: torch.Tensor) -> torch.Tensor:
+
+class DifferentiableExtrusionFast(nn.Module):
+    """
+    Even more optimized version that batches polygon processing.
+    Use this if you need maximum performance and have consistent polygon counts.
+    """
+    
+    def __init__(self, voxel_size: int = 64):
+        super().__init__()
+        self.voxel_size = int(voxel_size)
+        self.register_buffer("_coords", None)
+
+    def _ensure_coords(self, device):
+        """Initialize coordinate grid"""
+        if (self._coords is None or 
+            self._coords.device != device or 
+            self._coords.shape[0] != (self.voxel_size * self.voxel_size)):
+            
+            H = W = self.voxel_size
+            y, x = torch.meshgrid(
+                torch.arange(H, device=device), 
+                torch.arange(W, device=device), 
+                indexing="ij"
+            )
+            coords = torch.stack([x.flatten().float(), y.flatten().float()], dim=1)
+            coords = coords / float(self.voxel_size - 1)
+            self.register_buffer("_coords", coords)
+
+    def batch_polygon_sdf(self, polygons_batch, validity_mask):
         """
-        Convert polygon (P,2) in voxel coordinates to a flattened soft mask then reshape to [H,W].
-        Uses a simple distance-to-edge soft rasterization.
+        Compute SDF for multiple polygons simultaneously.
+        
+        Args:
+            polygons_batch: [N, P, 2] multiple polygons
+            validity_mask: [N] which polygons are valid
+        Returns:
+            sdfs: [N, H*W] signed distance fields
         """
-        device = polygon_voxel.device
-        D = self.voxel_size
-        H = self.voxel_size
-        W = self.voxel_size
+        device = polygons_batch.device
+        self._ensure_coords(device)
+        
+        N, P, _ = polygons_batch.shape
+        M = self._coords.shape[0]  # H*W
+        
+        # Initialize output
+        sdfs = torch.full((N, M), 1.0, device=device)  # Default to "outside"
+        
+        # Process only valid polygons
+        valid_indices = torch.where(validity_mask)[0]
+        if len(valid_indices) == 0:
+            return sdfs
+            
+        valid_polygons = polygons_batch[valid_indices]  # [N_valid, P, 2]
+        
+        # Remove zero-padded vertices for each polygon
+        # This is still a limitation - different polygons may have different valid vertex counts
+        # For full vectorization, you'd need to pad all polygons to the same vertex count
+        
+        for i, poly_idx in enumerate(valid_indices):
+            poly = valid_polygons[i]  # [P, 2]
+            vertex_mask = (poly.sum(dim=1) != 0.0)
+            if vertex_mask.sum().item() >= 3:
+                valid_poly = poly[vertex_mask]
+                sdf = self.polygon_sdf(valid_poly)
+                sdfs[poly_idx] = sdf
+        
+        return sdfs
 
-        # Prepare flattened pixel coordinates: [H*W, 2] as float
-        y_grid, x_grid = torch.meshgrid(
-            torch.arange(H, device=device),
-            torch.arange(W, device=device),
-            indexing="ij",
-        )
-        coords = torch.stack([x_grid.flatten().float(), y_grid.flatten().float()], dim=1)  # [H*W, 2]
+    def polygon_sdf(self, polygon_xy):
+        """Same SDF computation as the main class"""
+        device = polygon_xy.device
+        self._ensure_coords(device)
+        pts = self._coords
+        P = polygon_xy.shape[0]
+        
+        if P < 2:
+            return torch.full((pts.shape[0],), 1.0, device=device)
 
-        # Compute soft inside probability for each point
-        inside = self._point_in_polygon_soft(coords, polygon_voxel)  # [H*W]
+        v0 = polygon_xy.unsqueeze(1)
+        v1 = torch.roll(polygon_xy, shifts=-1, dims=0).unsqueeze(1)
+        pts_exp = pts.unsqueeze(0)
+        
+        e = v1 - v0
+        v = pts_exp - v0
+        e_norm_sq = (e**2).sum(dim=2, keepdim=True) + 1e-8
+        t = (v * e).sum(dim=2, keepdim=True) / e_norm_sq
+        t_clamped = t.clamp(0.0, 1.0)
+        
+        proj = v0 + t_clamped * e
+        diff = pts_exp - proj
+        dists = torch.norm(diff, dim=2)
+        min_dist_per_point, _ = dists.min(dim=0)
 
-        # Reshape to H x W
-        mask = inside.view(H, W)
+        x_pts = pts[:, 0].unsqueeze(0)
+        y_pts = pts[:, 1].unsqueeze(0)
+        x0, y0 = v0[..., 0], v0[..., 1]
+        x1, y1 = v1[..., 0], v1[..., 1]
 
-        return mask
+        y_crosses = ((y0 <= y_pts) & (y1 > y_pts)) | ((y1 <= y_pts) & (y0 > y_pts))
+        inter_x = x0 + (x1 - x0) * ((y_pts - y0) / (y1 - y0 + 1e-8))
+        crossings = (inter_x > x_pts) & y_crosses
+        crossing_count = crossings.sum(dim=0)
+        inside = (crossing_count % 2 == 1)
 
-    def _point_in_polygon_soft(self, points: torch.Tensor, polygon: torch.Tensor, sigma: float = 1.0) -> torch.Tensor:
-        """
-        Soft differentiable point-in-polygon test.
-        points: [M,2]
-        polygon: [P,2] (may include padded zeros)
-        Returns: [M] inside probability in [0,1]
-        """
-        device = points.device
+        sdf = min_dist_per_point.clone()
+        sdf[inside] = -sdf[inside]
+        return sdf
 
-        # Keep only valid polygon vertices (non-zero rows)
-        valid_mask = (polygon.sum(dim=1) != 0.0)
-        valid_poly = polygon[valid_mask]
-        if valid_poly.shape[0] < 3:
-            return torch.zeros(points.shape[0], device=device, dtype=torch.float32)
-
-        # Compute distance from each point to each polygon edge (vectorized)
-        P = valid_poly.shape[0]
-        M = points.shape[0]
-
-        # Prepare p1 and p2 for each edge: [P,2]
-        p1 = valid_poly
-        p2 = torch.roll(valid_poly, shifts=-1, dims=0)
-
-        # Expand to compute distances from all points to all edges
-        # points: [M,2], p1: [P,2] -> point_vec: [P, M, 2]
-        # We'll compute distances per edge then take min across edges.
-        # For memory safety we iterate edges if P large; typical P small (<=50)
-
-        distances = []
-        for i in range(P):
-            pi1 = p1[i]        # [2]
-            pi2 = p2[i]        # [2]
-            dist = self._point_to_line_distance(points, pi1, pi2)  # [M]
-            distances.append(dist)
-
-        distances_stack = torch.stack(distances, dim=0)  # [P, M]
-        min_dist, _ = distances_stack.min(dim=0)         # [M]
-
-        # Convert distance to inside probability: nearer to boundary => small distance
-        inside_prob = torch.sigmoid(-min_dist / float(sigma))
-        return inside_prob
-
-    def _point_to_line_distance(self, points: torch.Tensor, p1: torch.Tensor, p2: torch.Tensor) -> torch.Tensor:
-        """
-        Compute shortest distance from many points to a single line segment (p1->p2).
-        points: [M,2]
-        p1, p2: [2]
-        Returns: [M] distances
-        """
-        # Ensure float tensors
-        points = points.float()
-        p1 = p1.float()
-        p2 = p2.float()
-
-        # Line vector and length (scalar)
-        line_vec = p2 - p1                       # [2]
-        line_len = torch.norm(line_vec)          # scalar tensor
-
-        if line_len.item() < 1e-6:
-            # Degenerate segment -> distance to point p1
-            return torch.norm(points - p1.unsqueeze(0), dim=1)
-
-        # Unit direction
-        line_unit = line_vec / line_len          # [2]
-
-        # Vector from p1 to each point: [M,2]
-        point_vec = points - p1.unsqueeze(0)
-
-        # Projection scalars along unit line: [M] = (point_vec dot line_unit)
-        proj_length = torch.matmul(point_vec, line_unit)   # [M]
-
-        # Clamp projections to segment extents (numbers, not mixed tensor types)
-        proj_length = torch.clamp(proj_length, 0.0, float(line_len.item()))  # [M]
-
-        # Closest points coordinates on the infinite line: [M,2]
-        closest = p1.unsqueeze(0) + proj_length.unsqueeze(1) * line_unit.unsqueeze(0)
-
-        # Distances from points to closest points
-        dists = torch.norm(points - closest, dim=1)  # [M]
-        return dists
+    def forward(self, polygons: torch.Tensor, attributes: torch.Tensor, validity_scores: torch.Tensor) -> torch.Tensor:
+        """Forward pass with batch polygon processing"""
+        device = polygons.device
+        B, N, P, _ = polygons.shape
+        D = H = W = self.voxel_size
+        
+        voxels = torch.zeros((B, D, H, W), device=device)
+        
+        for b in range(B):
+            # Get validity mask for this sample
+            validity_mask = validity_scores[b] >= 0.5  # [N]
+            
+            if not validity_mask.any():
+                continue
+                
+            # Compute SDFs for all valid polygons in this sample
+            sdfs = self.batch_polygon_sdf(polygons[b], validity_mask)  # [N, H*W]
+            
+            # Convert to masks
+            sharpness = 100.0
+            masks = torch.sigmoid(-sdfs * sharpness)  # [N, H*W]
+            masks_2d = masks.view(N, H, W)  # [N, H, W]
+            
+            # Get wall height
+            wall_height_normalized = attributes[b, 0].item()
+            wall_height_m = wall_height_normalized * 5.0
+            height_voxels = max(1, min(D, int((wall_height_m / 5.0) * D)))
+            
+            # Combine all polygon masks for this sample
+            combined_mask = torch.zeros((H, W), device=device)
+            for n in range(N):
+                if validity_mask[n]:
+                    combined_mask = torch.maximum(combined_mask, masks_2d[n])
+            
+            # Extrude to 3D
+            mask_3d = combined_mask.unsqueeze(0).expand(height_voxels, -1, -1)
+            voxels[b, :height_voxels] = mask_3d
+            
+        return voxels

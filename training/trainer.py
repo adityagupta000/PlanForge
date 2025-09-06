@@ -6,6 +6,8 @@ multi-objective optimization, and cross-modal consistency learning
 
 import torch
 import torch.nn.utils
+# training/trainer.py
+from torch.cuda.amp import autocast, GradScaler
 import time
 import numpy as np
 import random
@@ -124,7 +126,16 @@ class AdaptiveMultiStageTrainer:
         self.stage_epoch = 0
         self.stage_start_time = None
         self.epoch_times = []
-
+        
+        # Add AMP and optimization settings
+        self.use_amp = getattr(config, "use_mixed_precision", True)
+        self.scaler = GradScaler(enabled=self.use_amp)
+        self.accumulation_steps = getattr(config, "accumulation_steps", 1)
+        self.dvx_step_freq = getattr(config, "dvx_step_freq", 1)
+        self.voxel_size_stage = getattr(config, "voxel_size_stage", None)
+        self.image_size_stage = getattr(config, "image_size_stage", None)
+        self._step = 0
+        
         # Enhanced optimizers with better hyperparameters
         self.optimizer_2d = torch.optim.AdamW(
             list(self.model.encoder.parameters())
@@ -241,7 +252,7 @@ class AdaptiveMultiStageTrainer:
         })
 
     def _train_epoch(self, mode="stage1"):
-        """Enhanced training epoch with dynamic loss weighting"""
+        """Enhanced training epoch with AMP, gradient accumulation, and DVX gating"""
         self.model.train()
         total_loss = 0
         component_loss_sums = {}
@@ -263,43 +274,73 @@ class AdaptiveMultiStageTrainer:
         )
 
         batch_count = 0
-        for batch in train_pbar:
+        epoch_start_time = time.time()
+        
+        for batch_idx, batch in enumerate(train_pbar):
+            self._step += 1
             batch = {
-                k: v.to(self.device) if torch.is_tensor(v) else v
+                k: v.to(self.device, non_blocking=True) if torch.is_tensor(v) else v
                 for k, v in batch.items()
             }
 
-            optimizer.zero_grad()
+            # Gate heavy DVX/extrusion: only run full forward every dvx_step_freq steps
+            run_full_geometric = (self.dvx_step_freq <= 1) or ((self._step % self.dvx_step_freq) == 0)
 
-            # Forward pass with enhanced predictions
-            predictions = self.model(batch["image"])
-            
-            # Add latent embeddings if model supports it
-            if hasattr(self.model, 'get_latent_embeddings'):
-                latent_2d, latent_3d = self.model.get_latent_embeddings(batch["image"])
-                predictions["latent_2d_embedding"] = latent_2d
-                predictions["latent_3d_embedding"] = latent_3d
+            # First-batch profiling (optional timing helper)
+            if batch_idx == 0 and self.global_epoch == 0:
+                torch.cuda.synchronize()
+                t0 = time.time()
+                with autocast(enabled=self.use_amp):
+                    out = self.model(batch["image"], run_full_geometric=True)
+                    # Prepare targets for loss computation
+                    targets = self._prepare_targets(batch, mode)
+                    shared_params = self._get_shared_parameters() if self.config.curriculum.use_gradnorm else None
+                    l, _ = self.loss_fn(out, targets, shared_params, run_full_geometric=True)
+                torch.cuda.synchronize()
+                print(f"First-batch forward+loss time: {time.time() - t0:.3f}s")
 
-            # Prepare targets based on training mode
-            targets = self._prepare_targets(batch, mode)
+            with autocast(enabled=self.use_amp):
+                # Forward pass with geometric gating
+                predictions = self.model(batch["image"], run_full_geometric=run_full_geometric)
+                
+                # Add latent embeddings if model supports it
+                if hasattr(self.model, 'get_latent_embeddings'):
+                    latent_2d, latent_3d = self.model.get_latent_embeddings(batch["image"])
+                    predictions["latent_2d_embedding"] = latent_2d
+                    predictions["latent_3d_embedding"] = latent_3d
 
-            # Get shared parameters for dynamic weighting
-            shared_params = self._get_shared_parameters() if self.config.curriculum.use_gradnorm else None
+                # Prepare targets based on training mode
+                targets = self._prepare_targets(batch, mode)
 
-            # Compute loss with dynamic weighting
-            loss, loss_components = self.loss_fn(predictions, targets, shared_params)
+                # Get shared parameters for dynamic weighting
+                shared_params = self._get_shared_parameters() if self.config.curriculum.use_gradnorm else None
 
-            loss.backward()
-            
-            # Apply gradient clipping
-            if mode == "stage2":
-                torch.nn.utils.clip_grad_norm_(self.model.dvx.parameters(), self.config.grad_clip_norm)
-            else:
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip_norm)
-            
-            optimizer.step()
+                # Compute loss with dynamic weighting and geometric gating
+                loss, loss_components = self.loss_fn(predictions, targets, shared_params, run_full_geometric=run_full_geometric)
+                
+                # Scale loss for gradient accumulation
+                loss = loss / self.accumulation_steps
 
-            current_loss = loss.item()
+            # Scale and backward pass
+            self.scaler.scale(loss).backward()
+
+            # Gradient accumulation step
+            if ((batch_idx + 1) % self.accumulation_steps) == 0:
+                # Unscale and clip gradients
+                self.scaler.unscale_(optimizer)
+                
+                # Apply gradient clipping
+                if mode == "stage2":
+                    torch.nn.utils.clip_grad_norm_(self.model.dvx.parameters(), self.config.grad_clip_norm)
+                else:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip_norm)
+                
+                # Optimizer step with scaler
+                self.scaler.step(optimizer)
+                self.scaler.update()
+                optimizer.zero_grad()
+
+            current_loss = loss.item() * self.accumulation_steps
             total_loss += current_loss
             
             # Track component losses
@@ -312,6 +353,14 @@ class AdaptiveMultiStageTrainer:
             
             batch_count += 1
             
+            # Occasional lightweight logging
+            if (batch_idx + 1) % 50 == 0:
+                elapsed = time.time() - epoch_start_time
+                avg_time_per_batch = elapsed / (batch_idx + 1)
+                current_weights = {k: f"{v:.3f}" for k, v in self.loss_fn.weights.items() if v > 0.001}
+                print(f"[Epoch {self.global_epoch}] Batch {batch_idx+1}/{len(self.train_loader)} | "
+                      f"avg batch {avg_time_per_batch:.3f}s | loss {total_loss/batch_count:.4f}")
+            
             # Update progress bar
             current_weights = {k: f"{v:.3f}" for k, v in self.loss_fn.weights.items() if v > 0.001}
             train_pbar.set_postfix({
@@ -319,12 +368,17 @@ class AdaptiveMultiStageTrainer:
                 "weights": str(current_weights)[:50] + "..." if len(str(current_weights)) > 50 else str(current_weights)
             })
 
+        # Final epoch timing
+        epoch_time = time.time() - epoch_start_time
+        avg_loss = total_loss / batch_count
+        print(f"Epoch {self.global_epoch} finished in {epoch_time/60:.2f} min. avg loss: {avg_loss:.4f}")
+
         # Average component losses
         avg_component_losses = {
             name: loss_sum / batch_count for name, loss_sum in component_loss_sums.items()
         }
         
-        return total_loss / batch_count, avg_component_losses
+        return avg_loss, avg_component_losses
 
     def _prepare_targets(self, batch, mode):
         """Prepare targets based on training mode"""
@@ -349,7 +403,7 @@ class AdaptiveMultiStageTrainer:
             }
 
     def _validate(self, mode="stage1"):
-        """Enhanced validation with detailed metrics"""
+        """Enhanced validation with detailed metrics and AMP support"""
         self.model.eval()
         total_loss = 0
         component_loss_sums = {}
@@ -365,21 +419,23 @@ class AdaptiveMultiStageTrainer:
         with torch.no_grad():
             for batch in val_pbar:
                 batch = {
-                    k: v.to(self.device) if torch.is_tensor(v) else v
+                    k: v.to(self.device, non_blocking=True) if torch.is_tensor(v) else v
                     for k, v in batch.items()
                 }
 
-                predictions = self.model(batch["image"])
-                
-                # Add latent embeddings if available
-                if hasattr(self.model, 'get_latent_embeddings'):
-                    latent_2d, latent_3d = self.model.get_latent_embeddings(batch["image"])
-                    predictions["latent_2d_embedding"] = latent_2d
-                    predictions["latent_3d_embedding"] = latent_3d
+                with autocast(enabled=self.use_amp):
+                    # Always run full geometric computation during validation
+                    predictions = self.model(batch["image"], run_full_geometric=True)
+                    
+                    # Add latent embeddings if available
+                    if hasattr(self.model, 'get_latent_embeddings'):
+                        latent_2d, latent_3d = self.model.get_latent_embeddings(batch["image"])
+                        predictions["latent_2d_embedding"] = latent_2d
+                        predictions["latent_3d_embedding"] = latent_3d
 
-                targets = self._prepare_targets(batch, mode)
+                    targets = self._prepare_targets(batch, mode)
 
-                loss, loss_components = self.loss_fn(predictions, targets)
+                    loss, loss_components = self.loss_fn(predictions, targets, run_full_geometric=True)
                 
                 current_loss = loss.item()
                 total_loss += current_loss
@@ -558,7 +614,7 @@ class AdaptiveMultiStageTrainer:
             print(f"Plateau: {plateau_epochs} epochs without improvement")
 
     def _save_rolling_checkpoint(self):
-        """Enhanced checkpoint saving with curriculum state and RNG state"""
+        """Enhanced checkpoint saving with curriculum state, RNG state, and scaler state"""
         checkpoint = {
             "model_state_dict": self.model.state_dict(),
             "optimizer_2d_state_dict": self.optimizer_2d.state_dict(),
@@ -567,6 +623,7 @@ class AdaptiveMultiStageTrainer:
             "scheduler_2d_state_dict": self.scheduler_2d.state_dict(),
             "scheduler_dvx_state_dict": self.scheduler_dvx.state_dict(),
             "scheduler_full_state_dict": self.scheduler_full.state_dict(),
+            "scaler_state_dict": self.scaler.state_dict(),  # Add AMP scaler state
             "loss_fn_state": {
                 "weights": self.loss_fn.weights,
                 "initial_weights": self.loss_fn.initial_weights
@@ -578,6 +635,7 @@ class AdaptiveMultiStageTrainer:
             "global_epoch": self.global_epoch,
             "stage_epoch": self.stage_epoch,
             "epoch_times": self.epoch_times,
+            "step_counter": self._step,  # Save step counter for DVX gating
             "curriculum_state": {
                 "loss_history": dict(self.curriculum_state.loss_history),
                 "component_losses": dict(self.curriculum_state.component_losses),
@@ -605,6 +663,10 @@ class AdaptiveMultiStageTrainer:
         self.optimizer_2d.load_state_dict(checkpoint["optimizer_2d_state_dict"])
         self.optimizer_dvx.load_state_dict(checkpoint["optimizer_dvx_state_dict"])
         self.optimizer_full.load_state_dict(checkpoint["optimizer_full_state_dict"])
+        
+        # Load scaler state for AMP
+        if "scaler_state_dict" in checkpoint:
+            self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
         
         # Safer scheduler loading
         for sched_key, sched_obj in [
@@ -641,6 +703,8 @@ class AdaptiveMultiStageTrainer:
             self.stage_epoch = checkpoint["stage_epoch"]
         if "epoch_times" in checkpoint:
             self.epoch_times = checkpoint["epoch_times"]
+        if "step_counter" in checkpoint:
+            self._step = checkpoint["step_counter"]
             
         # Restore curriculum state
         if "curriculum_state" in checkpoint:
@@ -806,6 +870,7 @@ class AdaptiveMultiStageTrainer:
             "scheduler_2d_state_dict": self.scheduler_2d.state_dict(),
             "scheduler_dvx_state_dict": self.scheduler_dvx.state_dict(),
             "scheduler_full_state_dict": self.scheduler_full.state_dict(),
+            "scaler_state_dict": self.scaler.state_dict(),
             "loss_fn_state": {
                 "weights": self.loss_fn.weights,
                 "initial_weights": self.loss_fn.initial_weights

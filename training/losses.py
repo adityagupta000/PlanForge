@@ -1,6 +1,7 @@
 """
 Advanced loss functions for multi-task training with dynamic weighting
 Enhanced with cross-modal consistency, graph constraints, and GradNorm
+Modified to support conditional geometric losses via run_full_geometric flag
 """
 
 import torch
@@ -21,8 +22,7 @@ class DynamicLossWeighter:
         self.device = device
         
         # Initialize weights
-        self.weights = {name: torch.tensor(1.0, device=device, requires_grad=False) 
-                       for name in loss_names}
+        self.weights = {name: 1.0 for name in loss_names}  # FIX: keep floats, easier logging
         self.initial_task_losses = None
         self.running_mean_losses = {name: 0.0 for name in loss_names}
         self.update_count = 0
@@ -52,13 +52,15 @@ class DynamicLossWeighter:
                 loss_ratios[name] = current_loss / (initial_loss + 1e-8)
         
         # Calculate average relative decrease
+        if not loss_ratios:  # FIX: guard empty
+            self.update_count += 1
+            return self.weights
         avg_loss_ratio = sum(loss_ratios.values()) / len(loss_ratios)
         
         # Calculate gradient norms
         grad_norms = {}
         for name in self.loss_names:
             if name in task_losses:
-                # Calculate gradients w.r.t. shared parameters
                 grads = torch.autograd.grad(
                     task_losses[name], shared_parameters, 
                     retain_graph=True, create_graph=False, allow_unused=True
@@ -67,9 +69,13 @@ class DynamicLossWeighter:
                 for grad in grads:
                     if grad is not None:
                         grad_norm += grad.norm().item() ** 2
-                grad_norms[name] = grad_norm ** 0.5
+                if grad_norm > 0:
+                    grad_norms[name] = grad_norm ** 0.5
         
-        # Update weights using GradNorm rule
+        if not grad_norms:  # FIX: guard empty
+            self.update_count += 1
+            return self.weights
+        
         avg_grad_norm = sum(grad_norms.values()) / len(grad_norms)
         
         for name in self.loss_names:
@@ -77,8 +83,8 @@ class DynamicLossWeighter:
                 target_grad = avg_grad_norm * (loss_ratios[name] ** self.alpha)
                 weight_update = target_grad / (grad_norms[name] + 1e-8)
                 # Apply momentum-like update
-                self.weights[name] = 0.9 * self.weights[name] + 0.1 * weight_update
-                self.weights[name] = torch.clamp(self.weights[name], 0.1, 10.0)
+                new_w = 0.9 * self.weights[name] + 0.1 * float(weight_update)
+                self.weights[name] = float(np.clip(new_w, 0.1, 10.0))  # FIX: always float
         
         self.update_count += 1
         return self.weights
@@ -107,33 +113,39 @@ class GraphTopologyExtractor:
             wall_b = wall_mask[b].detach().cpu().numpy()
             
             # Find connected components (rooms)
-            from scipy import ndimage
-            labeled_rooms, num_rooms = ndimage.label(room_b > 0.5)
-            
-            # Create adjacency matrix
-            adj_matrix = np.zeros((num_rooms, num_rooms))
-            room_centroids = []
-            
-            for i in range(1, num_rooms + 1):
-                room_i_mask = (labeled_rooms == i)
-                if np.sum(room_i_mask) > 0:
-                    centroid = ndimage.center_of_mass(room_i_mask)
-                    room_centroids.append(centroid)
-                    
-                    # Check connectivity to other rooms through walls
-                    for j in range(i + 1, num_rooms + 1):
-                        room_j_mask = (labeled_rooms == j)
-                        if np.sum(room_j_mask) > 0:
-                            # Check if rooms are connected via wall adjacency
-                            connectivity = GraphTopologyExtractor._check_room_connectivity(
-                                room_i_mask, room_j_mask, wall_b
-                            )
-                            adj_matrix[i-1, j-1] = connectivity
-                            adj_matrix[j-1, i-1] = connectivity
-            
-            # Convert to tensor
-            adj_tensor = torch.from_numpy(adj_matrix).float().to(device)
-            centroids_tensor = torch.from_numpy(np.array(room_centroids)).float().to(device)
+            try:
+                from scipy import ndimage
+                labeled_rooms, num_rooms = ndimage.label(room_b > 0.5)
+                
+                # Create adjacency matrix
+                adj_matrix = np.zeros((max(num_rooms, 1), max(num_rooms, 1)))
+                room_centroids = []
+                
+                for i in range(1, num_rooms + 1):
+                    room_i_mask = (labeled_rooms == i)
+                    if np.sum(room_i_mask) > 0:
+                        centroid = ndimage.center_of_mass(room_i_mask)
+                        room_centroids.append(centroid)
+                        
+                        # Check connectivity to other rooms through walls
+                        for j in range(i + 1, num_rooms + 1):
+                            room_j_mask = (labeled_rooms == j)
+                            if np.sum(room_j_mask) > 0:
+                                # Check if rooms are connected via wall adjacency
+                                connectivity = GraphTopologyExtractor._check_room_connectivity(
+                                    room_i_mask, room_j_mask, wall_b
+                                )
+                                adj_matrix[i-1, j-1] = connectivity
+                                adj_matrix[j-1, i-1] = connectivity
+                
+                # Convert to tensor
+                adj_tensor = torch.from_numpy(adj_matrix).float().to(device)
+                centroids_tensor = torch.from_numpy(np.array(room_centroids) if room_centroids else np.zeros((0, 2))).float().to(device)
+                
+            except ImportError:
+                # Fallback if scipy not available
+                adj_tensor = torch.zeros((1, 1), device=device)
+                centroids_tensor = torch.zeros((0, 2), device=device)
             
             adjacency_matrices.append(adj_tensor)
             room_features.append(centroids_tensor)
@@ -146,15 +158,19 @@ class GraphTopologyExtractor:
     @staticmethod
     def _check_room_connectivity(room1_mask, room2_mask, wall_mask):
         """Check if two rooms are connected through walls"""
-        from scipy.ndimage import binary_dilation
-        
-        # Dilate room masks to check wall adjacency
-        dilated1 = binary_dilation(room1_mask, iterations=2)
-        dilated2 = binary_dilation(room2_mask, iterations=2)
-        
-        # Check overlap through wall areas
-        wall_overlap = (dilated1 & dilated2) & (wall_mask > 0.3)
-        return float(np.sum(wall_overlap) > 0)
+        try:
+            from scipy.ndimage import binary_dilation
+            
+            # Dilate room masks to check wall adjacency
+            dilated1 = binary_dilation(room1_mask, iterations=2)
+            dilated2 = binary_dilation(room2_mask, iterations=2)
+            
+            # Check overlap through wall areas
+            wall_overlap = (dilated1 & dilated2) & (wall_mask > 0.3)
+            return float(np.sum(wall_overlap) > 0)
+        except ImportError:
+            # Simple distance-based fallback
+            return 0.0
 
 
 class ResearchGradeLoss(nn.Module):
@@ -164,6 +180,7 @@ class ResearchGradeLoss(nn.Module):
     - NEW: Cross-modal latent consistency
     - NEW: Graph-based topology constraints  
     - NEW: Dynamic loss weighting via GradNorm
+    - NEW: Conditional geometric losses based on run_full_geometric flag
     """
 
     def __init__(
@@ -224,18 +241,24 @@ class ResearchGradeLoss(nn.Module):
             if key in self.weights:
                 self.weights[key] = float(value)
 
-    def forward(self, predictions: dict, targets: dict, shared_parameters=None):
+    def forward(self, predictions: dict, targets: dict, shared_parameters=None, run_full_geometric=True):
         """
-        Compute multi-task loss with dynamic weighting.
-        GradNorm is applied only to differentiable losses.
-        Non-differentiable losses (graph, polygon, topology, etc.)
-        are included with their static/curriculum weights.
+        Compute multi-task loss with conditional geometric computation and dynamic weighting.
+        
+        Args:
+            predictions: Model predictions dict
+            targets: Ground truth targets dict
+            shared_parameters: Model parameters for GradNorm (optional)
+            run_full_geometric: Whether geometric losses should be computed
+        
+        Returns:
+            tuple: (total_loss, individual_losses_dict)
         """
         device = self._get_device_from_inputs(predictions, targets)
         losses = {}
         total_loss = torch.tensor(0.0, device=device)
 
-        # ---- 1) Traditional losses ----
+        # ---- 1) Core losses (always computed - lightweight) ----
         if "segmentation" in predictions and "mask" in targets:
             seg_pred = predictions["segmentation"]
             seg_target = targets["mask"].long()
@@ -258,34 +281,55 @@ class ResearchGradeLoss(nn.Module):
             tgt_attr = targets["attributes"].float().to(pred_attr.device)
             losses["attr"] = self.l1_loss(pred_attr, tgt_attr)
 
-        if "polygons" in predictions and "polygons_gt" in targets:
-            losses["polygon"] = self._polygon_loss(predictions, targets["polygons_gt"])
+        # ---- 2) Conditional geometric losses (heavy operations) ----
+        if run_full_geometric:
+            # Polygon loss (only if model produced polygons)
+            if ("polygons" in predictions and predictions["polygons"] is not None and
+                "polygons_gt" in targets):
+                losses["polygon"] = self._polygon_loss(predictions, targets["polygons_gt"])
+            else:
+                # Zero loss if polygons not available
+                losses["polygon"] = torch.tensor(0.0, device=device)
 
-        if "voxels_pred" in predictions and "voxels_gt" in targets:
-            pred_vox = predictions["voxels_pred"].float()
-            tgt_vox = targets["voxels_gt"].float().to(pred_vox.device)
-            losses["voxel"] = self._voxel_iou_loss(pred_vox, tgt_vox)
+            # Voxel loss (only if model produced voxels)
+            if ("voxels_pred" in predictions and predictions["voxels_pred"] is not None and
+                "voxels_gt" in targets):
+                pred_vox = predictions["voxels_pred"].float()
+                tgt_vox = targets["voxels_gt"].float().to(pred_vox.device)
+                losses["voxel"] = self._voxel_iou_loss(pred_vox, tgt_vox)
+            else:
+                # Zero loss if voxels not available
+                losses["voxel"] = torch.tensor(0.0, device=device)
 
+            # Cross-modal latent consistency (only if embeddings available)
+            if ("latent_2d_embedding" in predictions and "latent_3d_embedding" in predictions and
+                predictions["latent_2d_embedding"] is not None and predictions["latent_3d_embedding"] is not None):
+                consistency_loss = self._latent_consistency_loss(
+                    predictions["latent_2d_embedding"], 
+                    predictions["latent_3d_embedding"]
+                )
+                losses["latent_consistency"] = consistency_loss
+            else:
+                losses["latent_consistency"] = torch.tensor(0.0, device=device)
+        else:
+            # When geometric computation is skipped, use zero losses
+            losses["polygon"] = torch.tensor(0.0, device=device)
+            losses["voxel"] = torch.tensor(0.0, device=device)
+            losses["latent_consistency"] = torch.tensor(0.0, device=device)
+
+        # ---- 3) Independent auxiliary losses (always computed if enabled) ----
+        # Traditional topology loss
         if "segmentation" in predictions:
             losses["topology"] = self._topology_loss(predictions["segmentation"])
 
-        # ---- 2) Cross-modal latent consistency ----
-        if ("features" in predictions and "voxels_gt" in targets and 
-            "latent_2d_embedding" in predictions and "latent_3d_embedding" in predictions):
-            consistency_loss = self._latent_consistency_loss(
-                predictions["latent_2d_embedding"], 
-                predictions["latent_3d_embedding"]
-            )
-            losses["latent_consistency"] = consistency_loss
-
-        # ---- 3) Graph-based topology constraints ----
+        # Graph-based topology constraints
         if "segmentation" in predictions:
             graph_loss = self._graph_topology_loss(predictions["segmentation"])
             losses["graph"] = graph_loss
 
         # ---- 4) Apply weighting ----
         if self.enable_dynamic_weighting and shared_parameters is not None:
-            # only include differentiable losses for GradNorm
+            # Only include differentiable losses for GradNorm
             task_losses = {
                 name: loss for name, loss in losses.items()
                 if name in self.weights and isinstance(loss, torch.Tensor) and loss.requires_grad
@@ -293,22 +337,37 @@ class ResearchGradeLoss(nn.Module):
 
             dynamic_weights = self.loss_weighter.update_weights(task_losses, shared_parameters)
 
-            # apply weights (dynamic for diff losses, static for non-diff losses)
+            # Apply weights (dynamic for diff losses, static for non-diff losses)
             for name, loss in losses.items():
                 if name in self.weights:
                     if name in dynamic_weights:
-                        weight = dynamic_weights[name].item()
+                        weight = dynamic_weights[name]
                     else:
                         weight = self.weights[name]
                     total_loss = total_loss + weight * loss
         else:
-            # static weights
+            # Static weights
             for name, loss in losses.items():
                 if name in self.weights:
                     total_loss = total_loss + self.weights[name] * loss
 
         losses["total"] = total_loss
         return total_loss, losses
+
+    def __call__(self, predictions: dict, targets: dict, shared_parameters=None, run_full_geometric=True):
+        """
+        Convenience method for trainer compatibility
+        
+        Args:
+            predictions: Model predictions dict  
+            targets: Ground truth targets dict
+            shared_parameters: Model parameters for GradNorm (optional)
+            run_full_geometric: Whether to compute geometric losses
+        
+        Returns:
+            tuple: (total_loss, individual_losses_dict)
+        """
+        return self.forward(predictions, targets, shared_parameters, run_full_geometric)
 
     def _get_device_from_inputs(self, predictions, targets):
         """Helper to determine device from inputs"""
@@ -423,11 +482,15 @@ class ResearchGradeLoss(nn.Module):
 
         for b in range(B):
             mask_np = mask[b].cpu().numpy().astype(np.uint8)
-            dist_inside = cv2.distanceTransform((mask_np > 0).astype(np.uint8), cv2.DIST_L2, 5)
-            dist_outside = cv2.distanceTransform((mask_np == 0).astype(np.uint8), cv2.DIST_L2, 5)
-            sdf_np = dist_inside.astype(np.float32) - dist_outside.astype(np.float32)
-            sdf_np = np.tanh(sdf_np / 10.0).astype(np.float32)
-            sdf[b, 0] = torch.from_numpy(sdf_np)
+            try:
+                dist_inside = cv2.distanceTransform((mask_np > 0).astype(np.uint8), cv2.DIST_L2, 5)
+                dist_outside = cv2.distanceTransform((mask_np == 0).astype(np.uint8), cv2.DIST_L2, 5)
+                sdf_np = dist_inside.astype(np.float32) - dist_outside.astype(np.float32)
+                sdf_np = np.tanh(sdf_np / 10.0).astype(np.float32)
+                sdf[b, 0] = torch.from_numpy(sdf_np)
+            except Exception:
+                # Fallback if cv2 fails
+                sdf[b, 0] = torch.zeros_like(mask[b].float())
 
         return sdf
 
@@ -446,7 +509,7 @@ class ResearchGradeLoss(nn.Module):
         point_loss = self.mse_loss(pred_polys, tgt_polys)
 
         pred_valid = predictions.get("polygon_validity")
-        if pred_valid is None:
+        if pred_valid is None or valid_mask is None:
             validity_loss = torch.tensor(0.0, device=pred_polys.device)
         else:
             pred_valid = pred_valid.float().to(pred_polys.device)

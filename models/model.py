@@ -1,6 +1,7 @@
 """
-Enhanced model definition with auxiliary heads for novel training strategies
-Includes cross-modal consistency embeddings and graph structure interfaces
+Advanced loss functions for multi-task training with dynamic weighting
+Enhanced with cross-modal consistency, graph constraints, and GradNorm
+Modified to support conditional geometric losses via run_full_geometric flag
 """
 import torch
 import torch.nn as nn
@@ -172,6 +173,7 @@ class NeuralGeometric3DGenerator(nn.Module):
     - Cross-modal latent consistency
     - Graph structure prediction
     - Multi-view embeddings for dynamic curriculum
+    - Conditional geometric computation via run_full_geometric flag
     """
 
     def __init__(
@@ -258,16 +260,17 @@ class NeuralGeometric3DGenerator(nn.Module):
             "under keys like 'p1','p2','p3','p4','out', or 'high_res'."
         )
 
-    def forward(self, image, return_aux=True):
+    def forward(self, image, run_full_geometric=True, return_aux=True):
         """
-        Enhanced forward pass with auxiliary outputs
+        Enhanced forward pass with auxiliary outputs and conditional geometric computation
 
         Args:
             image: [B, C, H, W] input images
+            run_full_geometric: Whether to run heavy DVX and extrusion computations
             return_aux: Whether to compute auxiliary outputs
 
         Returns:
-            dict with all predictions including auxiliary outputs
+            dict with predictions, conditionally including geometric outputs
         """
         # Multi-scale feature extraction
         features = self.encoder(image)
@@ -285,7 +288,7 @@ class NeuralGeometric3DGenerator(nn.Module):
             features = {"main": enhanced_features, "enhanced": enhanced_features}
             main_features = enhanced_features
 
-        # Core predictions
+        # Core predictions (always computed - these are fast)
         segmentation = self.seg_head(features)
         attributes = self.attr_head(
             features.get("global")
@@ -294,39 +297,59 @@ class NeuralGeometric3DGenerator(nn.Module):
         )
         sdf = self.sdf_head(features)
 
-        # DVX polygon fitting
-        dvx_output = self.dvx(features, segmentation)
-        polygons = dvx_output["polygons"]
-        validity = dvx_output["validity"]
-
-        # 3D extrusion
-        voxels_pred = self.extrusion(polygons, attributes, validity)
-
         # Base outputs
         outputs = {
             "segmentation": segmentation,
             "attributes": attributes,
             "sdf": sdf,
-            "polygons": polygons,
-            "polygon_validity": validity,
-            "voxels_pred": voxels_pred,
             "features": features,
         }
 
-        # NEW: Auxiliary outputs for novel training strategies
-        if return_aux:
-            # Cross-modal consistency embeddings
-            if self.use_latent_consistency:
-                # Create 3D features from voxels for consistency
-                voxel_features = self._create_3d_features_from_voxels(voxels_pred)
-                latent_2d, latent_3d = self.latent_head(main_features, voxel_features)
+        # Conditional geometric computation (heavy operations)
+        if run_full_geometric:
+            # DVX polygon fitting
+            dvx_output = self.dvx(features, segmentation)
+            polygons = dvx_output["polygons"]
+            validity = dvx_output["validity"]
+
+            # 3D extrusion
+            voxels_pred = self.extrusion(polygons, attributes, validity)
+
+            # Add geometric outputs
+            outputs.update({
+                "polygons": polygons,
+                "polygon_validity": validity,
+                "voxels_pred": voxels_pred,
+            })
+
+            # NEW: Auxiliary outputs for novel training strategies (only when geometric is enabled)
+            if return_aux:
+                # Cross-modal consistency embeddings
+                if self.use_latent_consistency:
+                    # Create 3D features from voxels for consistency
+                    voxel_features = self._create_3d_features_from_voxels(voxels_pred)
+                    latent_2d, latent_3d = self.latent_head(main_features, voxel_features)
+                    outputs["latent_2d_embedding"] = latent_2d
+                    outputs["latent_3d_embedding"] = latent_3d
+        else:
+            # Provide placeholders to prevent downstream code from crashing
+            outputs.update({
+                "polygons": None,
+                "polygon_validity": None,
+                "voxels_pred": None,
+            })
+
+            # Still compute some auxiliary outputs that don't depend on geometry
+            if return_aux and self.use_latent_consistency:
+                # Use pseudo-3D features for 2D-only consistency
+                latent_2d, latent_3d = self.latent_head(main_features, None)
                 outputs["latent_2d_embedding"] = latent_2d
                 outputs["latent_3d_embedding"] = latent_3d
 
-            # Graph structure predictions
-            if self.use_graph_constraints:
-                graph_output = self.graph_head(main_features)
-                outputs.update(graph_output)
+        # Graph structure predictions (independent of geometric computation)
+        if return_aux and self.use_graph_constraints:
+            graph_output = self.graph_head(main_features)
+            outputs.update(graph_output)
 
         return outputs
 
