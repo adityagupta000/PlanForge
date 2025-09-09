@@ -6,8 +6,8 @@ multi-objective optimization, and cross-modal consistency learning
 
 import torch
 import torch.nn.utils
-# training/trainer.py
-from torch.cuda.amp import autocast, GradScaler
+# training/trainer.py - Fixed AMP imports
+from torch.amp import autocast, GradScaler
 import time
 import numpy as np
 import random
@@ -127,9 +127,9 @@ class AdaptiveMultiStageTrainer:
         self.stage_start_time = None
         self.epoch_times = []
         
-        # Add AMP and optimization settings
+        # Add AMP and optimization settings - Updated for new PyTorch API
         self.use_amp = getattr(config, "use_mixed_precision", True)
-        self.scaler = GradScaler(enabled=self.use_amp)
+        self.scaler = GradScaler('cuda', enabled=self.use_amp)
         self.accumulation_steps = getattr(config, "accumulation_steps", 1)
         self.dvx_step_freq = getattr(config, "dvx_step_freq", 1)
         self.voxel_size_stage = getattr(config, "voxel_size_stage", None)
@@ -290,7 +290,7 @@ class AdaptiveMultiStageTrainer:
             if batch_idx == 0 and self.global_epoch == 0:
                 torch.cuda.synchronize()
                 t0 = time.time()
-                with autocast(enabled=self.use_amp):
+                with autocast('cuda', enabled=self.use_amp):
                     out = self.model(batch["image"], run_full_geometric=True)
                     # Prepare targets for loss computation
                     targets = self._prepare_targets(batch, mode)
@@ -299,7 +299,7 @@ class AdaptiveMultiStageTrainer:
                 torch.cuda.synchronize()
                 print(f"First-batch forward+loss time: {time.time() - t0:.3f}s")
 
-            with autocast(enabled=self.use_amp):
+            with autocast('cuda', enabled=self.use_amp):
                 # Forward pass with geometric gating
                 predictions = self.model(batch["image"], run_full_geometric=run_full_geometric)
                 
@@ -423,7 +423,7 @@ class AdaptiveMultiStageTrainer:
                     for k, v in batch.items()
                 }
 
-                with autocast(enabled=self.use_amp):
+                with autocast('cuda', enabled=self.use_amp):
                     # Always run full geometric computation during validation
                     predictions = self.model(batch["image"], run_full_geometric=True)
                     

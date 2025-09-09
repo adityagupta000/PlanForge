@@ -276,15 +276,14 @@ class NeuralGeometric3DGenerator(nn.Module):
         features = self.encoder(image)
 
         # Enhance features
-        # Use robust selector to avoid accidentally selecting the 'global' vector.
         spatial_feat = self._select_spatial_feature(features)
         enhanced_features = self.feature_enhancer(spatial_feat)
+
         # keep structured features dict for heads that expect multi-scale inputs
         if isinstance(features, dict):
             features["enhanced"] = enhanced_features
             main_features = enhanced_features
         else:
-            # encoder returned 4D tensor
             features = {"main": enhanced_features, "enhanced": enhanced_features}
             main_features = enhanced_features
 
@@ -292,7 +291,7 @@ class NeuralGeometric3DGenerator(nn.Module):
         segmentation = self.seg_head(features)
         attributes = self.attr_head(
             features.get("global")
-            if "global" in features
+            if isinstance(features, dict) and "global" in features
             else main_features.mean(dim=[2, 3])
         )
         sdf = self.sdf_head(features)
@@ -309,11 +308,17 @@ class NeuralGeometric3DGenerator(nn.Module):
         if run_full_geometric:
             # DVX polygon fitting
             dvx_output = self.dvx(features, segmentation)
-            polygons = dvx_output["polygons"]
-            validity = dvx_output["validity"]
+            polygons = dvx_output.get("polygons", None)
+            validity = dvx_output.get("validity", None)
 
-            # 3D extrusion
-            voxels_pred = self.extrusion(polygons, attributes, validity)
+            # 3D extrusion (defensive: ensure inputs exist)
+            try:
+                voxels_pred = self.extrusion(polygons, attributes, validity)
+            except Exception as e:
+                # Log or print a helpful message for debugging; avoid crashing training
+                # (Replace print with logger if you have one)
+                print(f"[Warning] extrusion failed: {e}")
+                voxels_pred = None
 
             # Add geometric outputs
             outputs.update({
@@ -326,13 +331,16 @@ class NeuralGeometric3DGenerator(nn.Module):
             if return_aux:
                 # Cross-modal consistency embeddings
                 if self.use_latent_consistency:
-                    # Create 3D features from voxels for consistency
-                    voxel_features = self._create_3d_features_from_voxels(voxels_pred)
-                    latent_2d, latent_3d = self.latent_head(main_features, voxel_features)
+                    if voxels_pred is not None:
+                        voxel_features = self._create_3d_features_from_voxels(voxels_pred)
+                        latent_2d, latent_3d = self.latent_head(main_features, voxel_features)
+                    else:
+                        # Fall back to pseudo-3D built from 2D features if voxels not available
+                        latent_2d, latent_3d = self.latent_head(main_features, None)
                     outputs["latent_2d_embedding"] = latent_2d
                     outputs["latent_3d_embedding"] = latent_3d
         else:
-            # Provide placeholders to prevent downstream code from crashing
+            # Geometric path explicitly skipped for this stage
             outputs.update({
                 "polygons": None,
                 "polygon_validity": None,
@@ -341,7 +349,7 @@ class NeuralGeometric3DGenerator(nn.Module):
 
             # Still compute some auxiliary outputs that don't depend on geometry
             if return_aux and self.use_latent_consistency:
-                # Use pseudo-3D features for 2D-only consistency
+                # Use pseudo-3D features for 2D-only consistency inside latent head
                 latent_2d, latent_3d = self.latent_head(main_features, None)
                 outputs["latent_2d_embedding"] = latent_2d
                 outputs["latent_3d_embedding"] = latent_3d
@@ -363,24 +371,34 @@ class NeuralGeometric3DGenerator(nn.Module):
 
         with torch.no_grad():
             features = self.encoder(image)
-            # reuse robust selector to derive main_features
             spatial_feat = self._select_spatial_feature(features)
             main_features = self.feature_enhancer(spatial_feat)
 
-            # Quick forward to get voxels
+            # Quick forward to get segmentation/attributes
             segmentation = self.seg_head(features)
             attributes = self.attr_head(
                 features.get("global")
                 if isinstance(features, dict) and "global" in features
                 else main_features.mean(dim=[2, 3])
             )
-            dvx_output = self.dvx(features, segmentation)
-            voxels_pred = self.extrusion(
-                dvx_output["polygons"], attributes, dvx_output["validity"]
-            )
 
-        # Get embeddings
-        voxel_features = self._create_3d_features_from_voxels(voxels_pred)
+            # Attempt DVX + extrusion, but be defensive (may be expensive)
+            dvx_output = self.dvx(features, segmentation)
+            polygons = dvx_output.get("polygons", None)
+            validity = dvx_output.get("validity", None)
+
+            try:
+                voxels_pred = self.extrusion(polygons, attributes, validity)
+            except Exception as e:
+                print(f"[Warning] get_latent_embeddings: extrusion failed: {e}")
+                voxels_pred = None
+
+            # If voxels not available, latent_head will fall back to pseudo-3D
+            if voxels_pred is not None:
+                voxel_features = self._create_3d_features_from_voxels(voxels_pred)
+            else:
+                voxel_features = None
+
         return self.latent_head(main_features, voxel_features)
 
     def _create_3d_features_from_voxels(self, voxels):
@@ -393,6 +411,15 @@ class NeuralGeometric3DGenerator(nn.Module):
         Returns:
             [B, C, D, H, W] 3D features
         """
+        # Defensive check
+        if voxels is None:
+            raise ValueError(
+                "Received voxels=None in _create_3d_features_from_voxels(). "
+                "This indicates that the geometric pipeline was skipped or extrusion failed. "
+                "Call this method only when voxels are available, or use latent_head(..., None) to "
+                "compute pseudo-3D features from 2D."
+            )
+
         # Ensure expected shape
         if voxels.dim() != 4:
             raise ValueError(f"voxels must have shape [B,D,H,W], got {tuple(voxels.shape)}")
