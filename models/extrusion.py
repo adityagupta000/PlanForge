@@ -54,6 +54,34 @@ def _sanitize_normalized_height(value, sample_id=None, default=0.6):
 
     return raw
 
+
+def _sanitize_tensor(tensor, default_value=0.0, name="tensor"):
+    """
+    Sanitize an entire tensor by replacing NaN/Inf values with default.
+    
+    Args:
+        tensor: Input tensor
+        default_value: Value to replace invalid entries with
+        name: Name for logging
+    
+    Returns:
+        Sanitized tensor
+    """
+    if tensor.numel() == 0:
+        return tensor
+    
+    # Check for any invalid values
+    invalid_mask = ~torch.isfinite(tensor)
+    num_invalid = invalid_mask.sum().item()
+    
+    if num_invalid > 0:
+        logger.warning(f"Found {num_invalid} invalid values in {name}, replacing with {default_value}")
+        tensor = tensor.clone()
+        tensor[invalid_mask] = default_value
+    
+    return tensor
+
+
 # -----------------------------------------------------------------------------
 # Main extrusion module
 # -----------------------------------------------------------------------------
@@ -96,6 +124,9 @@ class DifferentiableExtrusion(nn.Module):
         if P < 2:
             return torch.full((pts.shape[0],), 1.0, device=device)
 
+        # Sanitize polygon coordinates
+        polygon_xy = _sanitize_tensor(polygon_xy, default_value=0.0, name="polygon_xy")
+
         v0 = polygon_xy.unsqueeze(1)
         v1 = torch.roll(polygon_xy, shifts=-1, dims=0).unsqueeze(1)
         pts_exp = pts.unsqueeze(0)
@@ -109,6 +140,9 @@ class DifferentiableExtrusion(nn.Module):
         proj = v0 + t_clamped * e
         diff = pts_exp - proj
         dists = torch.norm(diff, dim=2)
+        
+        # Sanitize distances before min operation
+        dists = _sanitize_tensor(dists, default_value=1.0, name="distances")
         min_dist_per_point, _ = dists.min(dim=0)
 
         x_pts = pts[:, 0].unsqueeze(0)
@@ -124,6 +158,9 @@ class DifferentiableExtrusion(nn.Module):
 
         sdf = min_dist_per_point.clone()
         sdf[inside] = -sdf[inside]
+        
+        # Final sanitization of SDF output
+        sdf = _sanitize_tensor(sdf, default_value=1.0, name="sdf")
         return sdf
 
     def forward(self, polygons, attributes, validity_scores, sample_ids=None):
@@ -134,6 +171,12 @@ class DifferentiableExtrusion(nn.Module):
         device = polygons.device
         B, N, P, _ = polygons.shape
         D = H = W = self.voxel_size
+        
+        # Sanitize input tensors
+        polygons = _sanitize_tensor(polygons, default_value=0.0, name="input_polygons")
+        attributes = _sanitize_tensor(attributes, default_value=0.6, name="input_attributes")
+        validity_scores = _sanitize_tensor(validity_scores, default_value=0.0, name="input_validity_scores")
+        
         voxels = torch.zeros((B, D, H, W), device=device)
 
         for b in range(B):
@@ -151,7 +194,46 @@ class DifferentiableExtrusion(nn.Module):
             height_voxels = int(round(height_frac * D))
             height_voxels = max(1, min(D, height_voxels))
 
-            # ... (rest of the forward method implementation would go here)
+            # Process each polygon for this batch
+            validity_mask = validity_scores[b] >= 0.5
+            if not validity_mask.any():
+                continue
+
+            combined_mask = torch.zeros((H, W), device=device)
+            sharpness = 100.0
+
+            for n in range(N):
+                if not validity_mask[n]:
+                    continue
+                    
+                polygon = polygons[b, n]  # [P, 2]
+                
+                # Filter out zero-padded vertices
+                vertex_mask = (polygon.sum(dim=1) != 0.0)
+                if vertex_mask.sum().item() < 3:
+                    continue
+                    
+                valid_polygon = polygon[vertex_mask]
+                
+                # Compute SDF for this polygon
+                sdf = self.polygon_sdf(valid_polygon)
+                mask = torch.sigmoid(-sdf * sharpness)
+                mask_2d = mask.view(H, W)
+                
+                # Sanitize mask before combining
+                mask_2d = _sanitize_tensor(mask_2d, default_value=0.0, name=f"mask_2d_b{b}_n{n}")
+                combined_mask = torch.maximum(combined_mask, mask_2d)
+
+            # Create 3D mask by extruding to the computed height
+            mask_3d = combined_mask.unsqueeze(0).expand(height_voxels, -1, -1)
+            
+            # Sanitize final mask before assignment
+            mask_3d = _sanitize_tensor(mask_3d, default_value=0.0, name=f"final_mask_3d_b{b}")
+            voxels[b, :height_voxels] = mask_3d
+
+        # Final sanitization of output
+        voxels = _sanitize_tensor(voxels, default_value=0.0, name="output_voxels")
+        return voxels
 
 
 # -----------------------------------------------------------------------------
@@ -214,6 +296,9 @@ class DifferentiableExtrusionFast(nn.Module):
         if P < 2:
             return torch.full((pts.shape[0],), 1.0, device=device)
 
+        # Sanitize polygon coordinates
+        polygon_xy = _sanitize_tensor(polygon_xy, default_value=0.0, name="polygon_xy_fast")
+
         v0 = polygon_xy.unsqueeze(1)
         v1 = torch.roll(polygon_xy, shifts=-1, dims=0).unsqueeze(1)
         pts_exp = pts.unsqueeze(0)
@@ -227,6 +312,9 @@ class DifferentiableExtrusionFast(nn.Module):
         proj = v0 + t_clamped * e
         diff = pts_exp - proj
         dists = torch.norm(diff, dim=2)
+        
+        # Sanitize distances before min operation
+        dists = _sanitize_tensor(dists, default_value=1.0, name="distances_fast")
         min_dist_per_point, _ = dists.min(dim=0)
 
         x_pts = pts[:, 0].unsqueeze(0)
@@ -242,12 +330,20 @@ class DifferentiableExtrusionFast(nn.Module):
 
         sdf = min_dist_per_point.clone()
         sdf[inside] = -sdf[inside]
+        
+        # Final sanitization of SDF output
+        sdf = _sanitize_tensor(sdf, default_value=1.0, name="sdf_fast")
         return sdf
 
     def forward(self, polygons: torch.Tensor, attributes: torch.Tensor, validity_scores: torch.Tensor) -> torch.Tensor:
         device = polygons.device
         B, N, P, _ = polygons.shape
         D = H = W = self.voxel_size
+
+        # Sanitize input tensors
+        polygons = _sanitize_tensor(polygons, default_value=0.0, name="input_polygons_fast")
+        attributes = _sanitize_tensor(attributes, default_value=0.6, name="input_attributes_fast")
+        validity_scores = _sanitize_tensor(validity_scores, default_value=0.0, name="input_validity_scores_fast")
 
         voxels = torch.zeros((B, D, H, W), device=device)
 
@@ -257,9 +353,16 @@ class DifferentiableExtrusionFast(nn.Module):
                 continue
 
             sdfs = self.batch_polygon_sdf(polygons[b], validity_mask)
+            
+            # Sanitize SDFs before sigmoid
+            sdfs = _sanitize_tensor(sdfs, default_value=1.0, name=f"batch_sdfs_b{b}")
+            
             sharpness = 100.0
             masks = torch.sigmoid(-sdfs * sharpness)
             masks_2d = masks.view(N, H, W)
+            
+            # Sanitize masks
+            masks_2d = _sanitize_tensor(masks_2d, default_value=0.0, name=f"masks_2d_b{b}")
 
             # Sanitize height
             wall_height_normalized = attributes[b, 0]
@@ -275,6 +378,11 @@ class DifferentiableExtrusionFast(nn.Module):
                     combined_mask = torch.maximum(combined_mask, masks_2d[n])
 
             mask_3d = combined_mask.unsqueeze(0).expand(height_voxels, -1, -1)
+            
+            # Sanitize final mask before assignment
+            mask_3d = _sanitize_tensor(mask_3d, default_value=0.0, name=f"final_mask_3d_fast_b{b}")
             voxels[b, :height_voxels] = mask_3d
 
+        # Final sanitization of output
+        voxels = _sanitize_tensor(voxels, default_value=0.0, name="output_voxels_fast")
         return voxels

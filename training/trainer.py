@@ -6,6 +6,7 @@ multi-objective optimization, and cross-modal consistency learning
 
 import torch
 import torch.nn.utils
+
 # training/trainer.py - Fixed AMP imports
 from torch.amp import autocast, GradScaler
 import time
@@ -22,17 +23,17 @@ from config import DEFAULT_TRAINING_CONFIG, DEFAULT_LOSS_CONFIG, StageTransition
 
 class CurriculumState:
     """Tracks curriculum learning state and metrics"""
-    
+
     def __init__(self, config):
         self.config = config
-        
+
         # Loss history for plateau detection
         self.loss_history = {
             "stage1": deque(maxlen=config.plateau_detection_window * 2),
-            "stage2": deque(maxlen=config.plateau_detection_window * 2), 
-            "stage3": deque(maxlen=config.plateau_detection_window * 2)
+            "stage2": deque(maxlen=config.plateau_detection_window * 2),
+            "stage3": deque(maxlen=config.plateau_detection_window * 2),
         }
-        
+
         # Component loss tracking
         self.component_losses = {
             "segmentation": deque(maxlen=20),
@@ -41,41 +42,41 @@ class CurriculumState:
             "voxel": deque(maxlen=20),
             "topology": deque(maxlen=20),
             "latent_consistency": deque(maxlen=20),
-            "graph": deque(maxlen=20)
+            "graph": deque(maxlen=20),
         }
-        
+
         # Gradient magnitude tracking for dynamic weighting
         self.gradient_norms = {
-            name: deque(maxlen=config.gradient_norm_window) 
+            name: deque(maxlen=config.gradient_norm_window)
             for name in self.component_losses.keys()
         }
-        
+
         # Stage transition tracking
         self.epochs_without_improvement = 0
-        self.best_val_loss = float('inf')
+        self.best_val_loss = float("inf")
         self.stage_transition_epochs = []
-        
+
         # Dynamic weights history
         self.weight_history = []
-        
+
     def update_loss_history(self, stage: str, val_loss: float):
         """Update validation loss history for plateau detection"""
         if stage in self.loss_history:
             self.loss_history[stage].append(val_loss)
-            
+
         # Update improvement tracking
         if val_loss < self.best_val_loss:
             self.best_val_loss = val_loss
             self.epochs_without_improvement = 0
         else:
             self.epochs_without_improvement += 1
-    
+
     def update_component_losses(self, loss_components: Dict[str, float]):
         """Update individual loss component history"""
         for name, loss_val in loss_components.items():
             if name in self.component_losses:
                 self.component_losses[name].append(loss_val)
-    
+
     def should_transition(self, current_stage: int) -> bool:
         """Check if should transition to next stage"""
         if current_stage == 1:
@@ -88,7 +89,7 @@ class CurriculumState:
             return StageTransitionCriteria.should_transition_from_stage2(
                 polygon_losses, self.config
             )
-        
+
         return False
 
 
@@ -96,19 +97,19 @@ class AdaptiveMultiStageTrainer:
     """
     Advanced multi-stage trainer with dynamic curriculum learning:
     - Adaptive stage transitioning based on performance plateaus
-    - Topology-aware loss scheduling  
+    - Topology-aware loss scheduling
     - Multi-objective optimization with dynamic weighting
     - Cross-modal latent consistency learning
     - Graph-based topology constraints
     """
-    
+
     # Class constant for rolling checkpoint path
     ROLLING_CHECKPOINT = "latest_checkpoint.pth"
 
     def __init__(self, model, train_loader, val_loader, device=None, config=None):
         if config is None:
             config = DEFAULT_TRAINING_CONFIG
-        
+
         self.model = model.to(device or config.device)
         self.train_loader = train_loader
         self.val_loader = val_loader
@@ -126,16 +127,16 @@ class AdaptiveMultiStageTrainer:
         self.stage_epoch = 0
         self.stage_start_time = None
         self.epoch_times = []
-        
+
         # Add AMP and optimization settings - Updated for new PyTorch API
         self.use_amp = getattr(config, "use_mixed_precision", True)
-        self.scaler = GradScaler('cuda', enabled=self.use_amp)
+        self.scaler = GradScaler("cuda", enabled=self.use_amp)
         self.accumulation_steps = getattr(config, "accumulation_steps", 1)
         self.dvx_step_freq = getattr(config, "dvx_step_freq", 1)
         self.voxel_size_stage = getattr(config, "voxel_size_stage", None)
         self.image_size_stage = getattr(config, "image_size_stage", None)
         self._step = 0
-        
+
         # Enhanced optimizers with better hyperparameters
         self.optimizer_2d = torch.optim.AdamW(
             list(self.model.encoder.parameters())
@@ -144,21 +145,21 @@ class AdaptiveMultiStageTrainer:
             + list(self.model.sdf_head.parameters()),
             lr=config.stage1_lr,
             weight_decay=config.stage1_weight_decay,
-            betas=(0.9, 0.999)
+            betas=(0.9, 0.999),
         )
 
         self.optimizer_dvx = torch.optim.AdamW(
-            self.model.dvx.parameters(), 
-            lr=config.stage2_lr, 
+            self.model.dvx.parameters(),
+            lr=config.stage2_lr,
             weight_decay=config.stage2_weight_decay,
-            betas=(0.9, 0.999)
+            betas=(0.9, 0.999),
         )
 
         self.optimizer_full = torch.optim.AdamW(
-            self.model.parameters(), 
-            lr=config.stage3_lr, 
+            self.model.parameters(),
+            lr=config.stage3_lr,
             weight_decay=config.stage3_weight_decay,
-            betas=(0.9, 0.999)
+            betas=(0.9, 0.999),
         )
 
         # Enhanced learning rate schedulers
@@ -184,12 +185,16 @@ class AdaptiveMultiStageTrainer:
             )
 
         # Enhanced loss function with dynamic weighting
-        base_loss_kwargs = {k: v for k, v in DEFAULT_LOSS_CONFIG.__dict__.items() if k != "enable_dynamic_weighting"}
+        base_loss_kwargs = {
+            k: v
+            for k, v in DEFAULT_LOSS_CONFIG.__dict__.items()
+            if k != "enable_dynamic_weighting"
+        }
         self.loss_fn = ResearchGradeLoss(
             **base_loss_kwargs,
             enable_dynamic_weighting=bool(config.curriculum.use_gradnorm),
             gradnorm_alpha=float(config.curriculum.gradnorm_alpha),
-            device=self.device
+            device=self.device,
         )
 
         self.history = {
@@ -198,18 +203,18 @@ class AdaptiveMultiStageTrainer:
             "stage3": {"train_loss": [], "val_loss": [], "component_losses": []},
             "stage_transitions": [],
             "dynamic_weights": [],
-            "curriculum_events": []
+            "curriculum_events": [],
         }
 
     def _get_eta_string(self, epoch, total_epochs):
         """Calculate and format ETA string"""
         if len(self.epoch_times) == 0:
             return "ETA: calculating..."
-        
+
         avg_epoch_time = sum(self.epoch_times) / len(self.epoch_times)
         remaining_epochs = total_epochs - epoch - 1
         eta_seconds = avg_epoch_time * remaining_epochs
-        
+
         if eta_seconds < 60:
             return f"ETA: {int(eta_seconds)}s"
         elif eta_seconds < 3600:
@@ -224,39 +229,47 @@ class AdaptiveMultiStageTrainer:
         # Return encoder parameters as shared across tasks
         return list(self.model.encoder.parameters())
 
-    def _update_loss_weights_for_curriculum(self, current_stage: int, stage_epoch: int, total_stage_epochs: int):
+    def _update_loss_weights_for_curriculum(
+        self, current_stage: int, stage_epoch: int, total_stage_epochs: int
+    ):
         """Update loss weights based on curriculum schedule"""
         base_weights = {
-            'seg': self.loss_fn.initial_weights['seg'],
-            'dice': self.loss_fn.initial_weights['dice'],
-            'sdf': self.loss_fn.initial_weights['sdf'], 
-            'attr': self.loss_fn.initial_weights['attr'],
-            'polygon': self.loss_fn.initial_weights['polygon'],
-            'voxel': self.loss_fn.initial_weights['voxel'],
-            'topology': self.loss_fn.initial_weights['topology'],
-            'latent_consistency': self.loss_fn.initial_weights['latent_consistency'],
-            'graph': self.loss_fn.initial_weights['graph']
+            "seg": self.loss_fn.initial_weights["seg"],
+            "dice": self.loss_fn.initial_weights["dice"],
+            "sdf": self.loss_fn.initial_weights["sdf"],
+            "attr": self.loss_fn.initial_weights["attr"],
+            "polygon": self.loss_fn.initial_weights["polygon"],
+            "voxel": self.loss_fn.initial_weights["voxel"],
+            "topology": self.loss_fn.initial_weights["topology"],
+            "latent_consistency": self.loss_fn.initial_weights["latent_consistency"],
+            "graph": self.loss_fn.initial_weights["graph"],
         }
-        
+
         scheduled_weights = self.loss_scheduler.get_scheduled_weights(
-            current_stage, self.global_epoch, stage_epoch, total_stage_epochs, base_weights
+            current_stage,
+            self.global_epoch,
+            stage_epoch,
+            total_stage_epochs,
+            base_weights,
         )
-        
+
         self.loss_fn.update_loss_weights(scheduled_weights)
-        
+
         # Log weight changes
-        self.history["dynamic_weights"].append({
-            "epoch": self.global_epoch,
-            "stage": current_stage,
-            "weights": scheduled_weights.copy()
-        })
+        self.history["dynamic_weights"].append(
+            {
+                "epoch": self.global_epoch,
+                "stage": current_stage,
+                "weights": scheduled_weights.copy(),
+            }
+        )
 
     def _train_epoch(self, mode="stage1"):
         """Enhanced training epoch with AMP, gradient accumulation, and DVX gating"""
         self.model.train()
         total_loss = 0
         component_loss_sums = {}
-        
+
         # Select appropriate optimizer based on mode
         if mode == "stage1":
             optimizer = self.optimizer_2d
@@ -267,15 +280,12 @@ class AdaptiveMultiStageTrainer:
 
         # Progress bar for training batches
         train_pbar = tqdm(
-            self.train_loader, 
-            desc=f"Training {mode.upper()}", 
-            leave=False,
-            ncols=120
+            self.train_loader, desc=f"Training {mode.upper()}", leave=False, ncols=120
         )
 
         batch_count = 0
         epoch_start_time = time.time()
-        
+
         for batch_idx, batch in enumerate(train_pbar):
             self._step += 1
             batch = {
@@ -284,28 +294,40 @@ class AdaptiveMultiStageTrainer:
             }
 
             # Gate heavy DVX/extrusion: only run full forward every dvx_step_freq steps
-            run_full_geometric = (self.dvx_step_freq <= 1) or ((self._step % self.dvx_step_freq) == 0)
+            run_full_geometric = (self.dvx_step_freq <= 1) or (
+                (self._step % self.dvx_step_freq) == 0
+            )
 
             # First-batch profiling (optional timing helper)
             if batch_idx == 0 and self.global_epoch == 0:
                 torch.cuda.synchronize()
                 t0 = time.time()
-                with autocast('cuda', enabled=self.use_amp):
+                with autocast("cuda", enabled=self.use_amp):
                     out = self.model(batch["image"], run_full_geometric=True)
                     # Prepare targets for loss computation
                     targets = self._prepare_targets(batch, mode)
-                    shared_params = self._get_shared_parameters() if self.config.curriculum.use_gradnorm else None
-                    l, _ = self.loss_fn(out, targets, shared_params, run_full_geometric=True)
+                    shared_params = (
+                        self._get_shared_parameters()
+                        if self.config.curriculum.use_gradnorm
+                        else None
+                    )
+                    l, _ = self.loss_fn(
+                        out, targets, shared_params, run_full_geometric=True
+                    )
                 torch.cuda.synchronize()
                 print(f"First-batch forward+loss time: {time.time() - t0:.3f}s")
 
-            with autocast('cuda', enabled=self.use_amp):
+            with autocast("cuda", enabled=self.use_amp):
                 # Forward pass with geometric gating
-                predictions = self.model(batch["image"], run_full_geometric=run_full_geometric)
-                
+                predictions = self.model(
+                    batch["image"], run_full_geometric=run_full_geometric
+                )
+
                 # Add latent embeddings if model supports it
-                if hasattr(self.model, 'get_latent_embeddings'):
-                    latent_2d, latent_3d = self.model.get_latent_embeddings(batch["image"])
+                if hasattr(self.model, "get_latent_embeddings"):
+                    latent_2d, latent_3d = self.model.get_latent_embeddings(
+                        batch["image"]
+                    )
                     predictions["latent_2d_embedding"] = latent_2d
                     predictions["latent_3d_embedding"] = latent_3d
 
@@ -313,11 +335,20 @@ class AdaptiveMultiStageTrainer:
                 targets = self._prepare_targets(batch, mode)
 
                 # Get shared parameters for dynamic weighting
-                shared_params = self._get_shared_parameters() if self.config.curriculum.use_gradnorm else None
+                shared_params = (
+                    self._get_shared_parameters()
+                    if self.config.curriculum.use_gradnorm
+                    else None
+                )
 
                 # Compute loss with dynamic weighting and geometric gating
-                loss, loss_components = self.loss_fn(predictions, targets, shared_params, run_full_geometric=run_full_geometric)
-                
+                loss, loss_components = self.loss_fn(
+                    predictions,
+                    targets,
+                    shared_params,
+                    run_full_geometric=run_full_geometric,
+                )
+
                 # Scale loss for gradient accumulation
                 loss = loss / self.accumulation_steps
 
@@ -328,13 +359,12 @@ class AdaptiveMultiStageTrainer:
             if ((batch_idx + 1) % self.accumulation_steps) == 0:
                 # Unscale and clip gradients
                 self.scaler.unscale_(optimizer)
-                
+
                 # Apply gradient clipping
                 torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(),
-                self.config.grad_clip_norm
+                    self.model.parameters(), self.config.grad_clip_norm
                 )
-                
+
                 # Optimizer step with scaler
                 self.scaler.step(optimizer)
                 self.scaler.update()
@@ -342,42 +372,59 @@ class AdaptiveMultiStageTrainer:
 
             current_loss = loss.item() * self.accumulation_steps
             total_loss += current_loss
-            
+
             # Track component losses
             for name, component_loss in loss_components.items():
                 if name != "total":
-                    loss_val = component_loss.item() if torch.is_tensor(component_loss) else component_loss
+                    loss_val = (
+                        component_loss.item()
+                        if torch.is_tensor(component_loss)
+                        else component_loss
+                    )
                     if name not in component_loss_sums:
                         component_loss_sums[name] = 0
                     component_loss_sums[name] += loss_val
-            
+
             batch_count += 1
-            
+
             # Occasional lightweight logging
             if (batch_idx + 1) % 50 == 0:
                 elapsed = time.time() - epoch_start_time
                 avg_time_per_batch = elapsed / (batch_idx + 1)
-                current_weights = {k: f"{v:.3f}" for k, v in self.loss_fn.weights.items() if v > 0.001}
-                print(f"[Epoch {self.global_epoch}] Batch {batch_idx+1}/{len(self.train_loader)} | "
-                      f"avg batch {avg_time_per_batch:.3f}s | loss {total_loss/batch_count:.4f}")
-            
+                current_weights = {
+                    k: f"{v:.3f}" for k, v in self.loss_fn.weights.items() if v > 0.001
+                }
+                print(
+                    f"[Epoch {self.global_epoch}] Batch {batch_idx+1}/{len(self.train_loader)} | "
+                    f"avg batch {avg_time_per_batch:.3f}s | loss {total_loss/batch_count:.4f}"
+                )
+
             # Update progress bar
-            current_weights = {k: f"{v:.3f}" for k, v in self.loss_fn.weights.items() if v > 0.001}
-            train_pbar.set_postfix({
-                "loss": f"{current_loss:.4f}",
-                "weights": str(current_weights)[:50] + "..." if len(str(current_weights)) > 50 else str(current_weights)
-            })
+            current_weights = {
+                k: f"{v:.3f}" for k, v in self.loss_fn.weights.items() if v > 0.001
+            }
+            train_pbar.set_postfix(
+                {
+                    "loss": f"{current_loss:.4f}",
+                    "weights": str(current_weights)[:50] + "..."
+                    if len(str(current_weights)) > 50
+                    else str(current_weights),
+                }
+            )
 
         # Final epoch timing
         epoch_time = time.time() - epoch_start_time
         avg_loss = total_loss / batch_count
-        print(f"Epoch {self.global_epoch} finished in {epoch_time/60:.2f} min. avg loss: {avg_loss:.4f}")
+        print(
+            f"Epoch {self.global_epoch} finished in {epoch_time/60:.2f} min. avg loss: {avg_loss:.4f}"
+        )
 
         # Average component losses
         avg_component_losses = {
-            name: loss_sum / batch_count for name, loss_sum in component_loss_sums.items()
+            name: loss_sum / batch_count
+            for name, loss_sum in component_loss_sums.items()
         }
-        
+
         return avg_loss, avg_component_losses
 
     def _prepare_targets(self, batch, mode):
@@ -409,10 +456,7 @@ class AdaptiveMultiStageTrainer:
         component_loss_sums = {}
 
         val_pbar = tqdm(
-            self.val_loader, 
-            desc=f"Validating {mode.upper()}", 
-            leave=False,
-            ncols=120
+            self.val_loader, desc=f"Validating {mode.upper()}", leave=False, ncols=120
         )
 
         batch_count = 0
@@ -423,36 +467,45 @@ class AdaptiveMultiStageTrainer:
                     for k, v in batch.items()
                 }
 
-                with autocast('cuda', enabled=self.use_amp):
+                with autocast("cuda", enabled=self.use_amp):
                     # Always run full geometric computation during validation
                     predictions = self.model(batch["image"], run_full_geometric=True)
-                    
+
                     # Add latent embeddings if available
-                    if hasattr(self.model, 'get_latent_embeddings'):
-                        latent_2d, latent_3d = self.model.get_latent_embeddings(batch["image"])
+                    if hasattr(self.model, "get_latent_embeddings"):
+                        latent_2d, latent_3d = self.model.get_latent_embeddings(
+                            batch["image"]
+                        )
                         predictions["latent_2d_embedding"] = latent_2d
                         predictions["latent_3d_embedding"] = latent_3d
 
                     targets = self._prepare_targets(batch, mode)
 
-                    loss, loss_components = self.loss_fn(predictions, targets, run_full_geometric=True)
-                
+                    loss, loss_components = self.loss_fn(
+                        predictions, targets, run_full_geometric=True
+                    )
+
                 current_loss = loss.item()
                 total_loss += current_loss
-                
+
                 # Track component losses
                 for name, component_loss in loss_components.items():
                     if name != "total":
-                        loss_val = component_loss.item() if torch.is_tensor(component_loss) else component_loss
+                        loss_val = (
+                            component_loss.item()
+                            if torch.is_tensor(component_loss)
+                            else component_loss
+                        )
                         if name not in component_loss_sums:
                             component_loss_sums[name] = 0
                         component_loss_sums[name] += loss_val
-                
+
                 batch_count += 1
                 val_pbar.set_postfix({"loss": f"{current_loss:.4f}"})
 
         avg_component_losses = {
-            name: loss_sum / batch_count for name, loss_sum in component_loss_sums.items()
+            name: loss_sum / batch_count
+            for name, loss_sum in component_loss_sums.items()
         }
 
         return total_loss / batch_count, avg_component_losses
@@ -460,9 +513,9 @@ class AdaptiveMultiStageTrainer:
     def train_stage_adaptive(self, stage: int, max_epochs: int, min_epochs: int):
         """
         Train a stage with adaptive termination based on curriculum learning
-        
+
         Args:
-            stage: Stage number (1, 2, 3)  
+            stage: Stage number (1, 2, 3)
             max_epochs: Maximum epochs for this stage
             min_epochs: Minimum epochs before considering transition
         """
@@ -483,16 +536,18 @@ class AdaptiveMultiStageTrainer:
         self._configure_stage_parameters(stage)
 
         mode_name = f"stage{stage}"
-        
+
         for epoch in range(start_epoch, max_epochs):
             epoch_start_time = time.time()
             self.stage_epoch = epoch
             self.global_epoch += 1
-            
+
             # Update loss weights based on curriculum
             self._update_loss_weights_for_curriculum(stage, epoch, max_epochs)
-            
-            print(f"\nStage {stage} - Epoch {epoch+1}/{max_epochs} (Global: {self.global_epoch})")
+
+            print(
+                f"\nStage {stage} - Epoch {epoch+1}/{max_epochs} (Global: {self.global_epoch})"
+            )
 
             # Training and validation
             train_loss, train_components = self._train_epoch(mode_name)
@@ -501,7 +556,7 @@ class AdaptiveMultiStageTrainer:
             # Record epoch time
             epoch_time = time.time() - epoch_start_time
             self.epoch_times.append(epoch_time)
-            
+
             if len(self.epoch_times) > 10:
                 self.epoch_times.pop(0)
 
@@ -523,29 +578,44 @@ class AdaptiveMultiStageTrainer:
                 self.scheduler_full.step()
 
             # Display comprehensive results
-            self._display_epoch_results(epoch, max_epochs, train_loss, val_loss, 
-                                      train_components, val_components, epoch_time)
+            self._display_epoch_results(
+                epoch,
+                max_epochs,
+                train_loss,
+                val_loss,
+                train_components,
+                val_components,
+                epoch_time,
+            )
 
             # Check for adaptive stage transition
             if epoch >= min_epochs:
                 should_transition = self.curriculum_state.should_transition(stage)
                 if should_transition:
-                    print(f"\n🔄 ADAPTIVE TRANSITION: Stage {stage} converged after {epoch+1} epochs")
-                    print("   Detected performance plateau - transitioning to next stage")
-                    
-                    self.history["stage_transitions"].append({
-                        "from_stage": stage,
-                        "epoch": epoch + 1,
-                        "global_epoch": self.global_epoch,
-                        "reason": "performance_plateau"
-                    })
-                    
-                    self.history["curriculum_events"].append({
-                        "type": "stage_transition",
-                        "stage": stage,
-                        "epoch": self.global_epoch,
-                        "details": f"Converged after {epoch+1} epochs"
-                    })
+                    print(
+                        f"\n🔄 ADAPTIVE TRANSITION: Stage {stage} converged after {epoch+1} epochs"
+                    )
+                    print(
+                        "   Detected performance plateau - transitioning to next stage"
+                    )
+
+                    self.history["stage_transitions"].append(
+                        {
+                            "from_stage": stage,
+                            "epoch": epoch + 1,
+                            "global_epoch": self.global_epoch,
+                            "reason": "performance_plateau",
+                        }
+                    )
+
+                    self.history["curriculum_events"].append(
+                        {
+                            "type": "stage_transition",
+                            "stage": stage,
+                            "epoch": self.global_epoch,
+                            "details": f"Converged after {epoch+1} epochs",
+                        }
+                    )
                     break
 
             # Save rolling checkpoint
@@ -559,7 +629,7 @@ class AdaptiveMultiStageTrainer:
         # First freeze everything
         for param in self.model.parameters():
             param.requires_grad = False
-            
+
         if stage == 1:
             # Stage 1: Segmentation + Attributes (2D only)
             for param in self.model.encoder.parameters():
@@ -570,7 +640,7 @@ class AdaptiveMultiStageTrainer:
                 param.requires_grad = True
             for param in self.model.sdf_head.parameters():
                 param.requires_grad = True
-                
+
         elif stage == 2:
             # Stage 2: DVX training (polygon fitting) - keep encoder frozen initially
             for param in self.model.dvx.parameters():
@@ -579,35 +649,56 @@ class AdaptiveMultiStageTrainer:
             if self.stage_epoch > 10:
                 for param in self.model.encoder.parameters():
                     param.requires_grad = True
-                    
+
         else:  # stage == 3
             # Stage 3: End-to-end fine-tuning (all parameters)
             for param in self.model.parameters():
                 param.requires_grad = True
 
-    def _display_epoch_results(self, epoch: int, total_epochs: int, train_loss: float, 
-                              val_loss: float, train_components: Dict, val_components: Dict, 
-                              epoch_time: float):
+    def _display_epoch_results(
+        self,
+        epoch: int,
+        total_epochs: int,
+        train_loss: float,
+        val_loss: float,
+        train_components: Dict,
+        val_components: Dict,
+        epoch_time: float,
+    ):
         """Display comprehensive epoch results with curriculum information"""
         eta_str = self._get_eta_string(epoch, total_epochs)
-        
+
         print(f"Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
         print(f"Epoch time: {epoch_time:.1f}s, {eta_str}")
-        
+
         # Show significant component losses
-        significant_components = {k: v for k, v in val_components.items() 
-                                if v > 0.01 and k in ['seg', 'dice', 'polygon', 'voxel', 'topology',
-                                                     'latent_consistency', 'graph']}
+        significant_components = {
+            k: v
+            for k, v in val_components.items()
+            if v > 0.01
+            and k
+            in [
+                "seg",
+                "dice",
+                "polygon",
+                "voxel",
+                "topology",
+                "latent_consistency",
+                "graph",
+            ]
+        }
         if significant_components:
-            comp_str = ", ".join([f"{k}: {v:.3f}" for k, v in significant_components.items()])
+            comp_str = ", ".join(
+                [f"{k}: {v:.3f}" for k, v in significant_components.items()]
+            )
             print(f"Components: {comp_str}")
-        
+
         # Show current loss weights for active components
         active_weights = {k: v for k, v in self.loss_fn.weights.items() if v > 0.001}
         if active_weights:
             weight_str = ", ".join([f"{k}: {v:.3f}" for k, v in active_weights.items()])
             print(f"Weights: {weight_str}")
-        
+
         # Show curriculum status
         plateau_epochs = self.curriculum_state.epochs_without_improvement
         if plateau_epochs > 0:
@@ -626,7 +717,7 @@ class AdaptiveMultiStageTrainer:
             "scaler_state_dict": self.scaler.state_dict(),  # Add AMP scaler state
             "loss_fn_state": {
                 "weights": self.loss_fn.weights,
-                "initial_weights": self.loss_fn.initial_weights
+                "initial_weights": self.loss_fn.initial_weights,
             },
             "history": self.history,
             "config": self.config,
@@ -641,16 +732,18 @@ class AdaptiveMultiStageTrainer:
                 "component_losses": dict(self.curriculum_state.component_losses),
                 "epochs_without_improvement": self.curriculum_state.epochs_without_improvement,
                 "best_val_loss": self.curriculum_state.best_val_loss,
-                "stage_transition_epochs": self.curriculum_state.stage_transition_epochs
+                "stage_transition_epochs": self.curriculum_state.stage_transition_epochs,
             },
             "rng_state": {
                 "torch": torch.get_rng_state(),
-                "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+                "cuda": torch.cuda.get_rng_state_all()
+                if torch.cuda.is_available()
+                else None,
                 "numpy": np.random.get_state(),
                 "python": random.getstate(),
-            }
+            },
         }
-        
+
         checkpoint_path = self.ROLLING_CHECKPOINT
         torch.save(checkpoint, checkpoint_path)
         print(f"Rolling checkpoint saved: {checkpoint_path}")
@@ -658,16 +751,16 @@ class AdaptiveMultiStageTrainer:
     def load_checkpoint(self, filename):
         """Enhanced checkpoint loading with curriculum state restoration and device handling"""
         checkpoint = torch.load(filename, map_location=self.device)
-        
+
         self.model.load_state_dict(checkpoint["model_state_dict"])
         self.optimizer_2d.load_state_dict(checkpoint["optimizer_2d_state_dict"])
         self.optimizer_dvx.load_state_dict(checkpoint["optimizer_dvx_state_dict"])
         self.optimizer_full.load_state_dict(checkpoint["optimizer_full_state_dict"])
-        
+
         # Load scaler state for AMP
         if "scaler_state_dict" in checkpoint:
             self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
-        
+
         # Safer scheduler loading
         for sched_key, sched_obj in [
             ("scheduler_2d_state_dict", self.scheduler_2d),
@@ -676,7 +769,7 @@ class AdaptiveMultiStageTrainer:
         ]:
             if sched_key in checkpoint:
                 sched_obj.load_state_dict(checkpoint[sched_key])
-        
+
         # Load loss weights with proper device handling
         if "loss_fn_state" in checkpoint:
             loaded_weights = checkpoint["loss_fn_state"]["weights"]
@@ -687,11 +780,13 @@ class AdaptiveMultiStageTrainer:
                 }
             else:
                 self.loss_fn.weights = loaded_weights
-            self.loss_fn.initial_weights = checkpoint["loss_fn_state"]["initial_weights"]
-        
+            self.loss_fn.initial_weights = checkpoint["loss_fn_state"][
+                "initial_weights"
+            ]
+
         if "history" in checkpoint:
             self.history = checkpoint["history"]
-            
+
         # Restore training state
         if "current_stage" in checkpoint:
             self.current_stage = checkpoint["current_stage"]
@@ -705,48 +800,104 @@ class AdaptiveMultiStageTrainer:
             self.epoch_times = checkpoint["epoch_times"]
         if "step_counter" in checkpoint:
             self._step = checkpoint["step_counter"]
-            
+
         # Restore curriculum state
         if "curriculum_state" in checkpoint:
             cs = checkpoint["curriculum_state"]
             for key, history in cs["loss_history"].items():
-                self.curriculum_state.loss_history[key] = deque(history, maxlen=self.config.curriculum.plateau_detection_window * 2)
+                self.curriculum_state.loss_history[key] = deque(
+                    history, maxlen=self.config.curriculum.plateau_detection_window * 2
+                )
             for key, history in cs["component_losses"].items():
                 self.curriculum_state.component_losses[key] = deque(history, maxlen=20)
-            self.curriculum_state.epochs_without_improvement = cs.get("epochs_without_improvement", 0)
-            self.curriculum_state.best_val_loss = cs.get("best_val_loss", float('inf'))
-            self.curriculum_state.stage_transition_epochs = cs.get("stage_transition_epochs", [])
-        
+            self.curriculum_state.epochs_without_improvement = cs.get(
+                "epochs_without_improvement", 0
+            )
+            self.curriculum_state.best_val_loss = cs.get("best_val_loss", float("inf"))
+            self.curriculum_state.stage_transition_epochs = cs.get(
+                "stage_transition_epochs", []
+            )
+
         # Restore RNG states
         if "rng_state" in checkpoint:
-            torch.set_rng_state(checkpoint["rng_state"]["torch"])
-            if torch.cuda.is_available() and checkpoint["rng_state"]["cuda"] is not None:
-                torch.cuda.set_rng_state_all(checkpoint["rng_state"]["cuda"])
-            np.random.set_state(checkpoint["rng_state"]["numpy"])
-            random.setstate(checkpoint["rng_state"]["python"])
-        
+            rs = checkpoint["rng_state"]
+
+            # --- Torch RNG (CPU) ---
+            try:
+                torch_state = rs.get("torch", None)
+                if torch_state is not None:
+                    # If it's already a torch tensor with uint8 dtype, use directly
+                    if torch.is_tensor(torch_state) and torch_state.dtype == torch.uint8:
+                        torch.set_rng_state(torch_state)
+                    else:
+                        # Convert lists / numpy arrays / other tensors to uint8 torch tensor
+                        torch.set_rng_state(torch.tensor(torch_state, dtype=torch.uint8))
+            except Exception as e:
+                print(f"Warning: could not restore torch RNG state ({e}), skipping.")
+
+            # --- CUDA RNG (all devices) ---
+            try:
+                cuda_state = rs.get("cuda", None)
+                if cuda_state is not None and torch.cuda.is_available():
+                    # cuda_state might be a list of states (one per device)
+                    cuda_tensors = []
+                    for s in cuda_state:
+                        if torch.is_tensor(s) and s.dtype == torch.uint8:
+                            cuda_tensors.append(s)
+                        else:
+                            cuda_tensors.append(torch.tensor(s, dtype=torch.uint8))
+                    torch.cuda.set_rng_state_all(cuda_tensors)
+            except Exception as e:
+                print(f"Warning: could not restore CUDA RNG state ({e}), skipping.")
+
+            # --- numpy RNG ---
+            try:
+                if "numpy" in rs and rs["numpy"] is not None:
+                    np.random.set_state(rs["numpy"])
+            except Exception as e:
+                print(f"Warning: could not restore numpy RNG state ({e}), skipping.")
+
+            # --- python random RNG ---
+            try:
+                if "python" in rs and rs["python"] is not None:
+                    random.setstate(rs["python"])
+            except Exception as e:
+                print(f"Warning: could not restore python RNG state ({e}), skipping.")
+
         # Restore DataLoader sampler states if available
         if "dataloader_state" in checkpoint:
             dl_state = checkpoint["dataloader_state"]
-            if dl_state["train_sampler_state"] is not None and hasattr(self.train_loader.sampler, '__dict__'):
+            if dl_state["train_sampler_state"] is not None and hasattr(
+                self.train_loader.sampler, "__dict__"
+            ):
                 try:
-                    self.train_loader.sampler.__dict__.update(dl_state["train_sampler_state"])
+                    self.train_loader.sampler.__dict__.update(
+                        dl_state["train_sampler_state"]
+                    )
                 except Exception:
                     print("Warning: Could not restore train_loader sampler state")
-            if dl_state["val_sampler_state"] is not None and hasattr(self.val_loader.sampler, '__dict__'):
+            if dl_state["val_sampler_state"] is not None and hasattr(
+                self.val_loader.sampler, "__dict__"
+            ):
                 try:
-                    self.val_loader.sampler.__dict__.update(dl_state["val_sampler_state"])
+                    self.val_loader.sampler.__dict__.update(
+                        dl_state["val_sampler_state"]
+                    )
                 except Exception:
                     print("Warning: Could not restore val_loader sampler state")
-        
+
         print(f"Checkpoint loaded: {filename}")
-        print(f"Resuming from Stage {self.current_stage}, Global Epoch {self.global_epoch}")
-        print(f"Curriculum state restored with {self.curriculum_state.epochs_without_improvement} epochs without improvement")
+        print(
+            f"Resuming from Stage {self.current_stage}, Global Epoch {self.global_epoch}"
+        )
+        print(
+            f"Curriculum state restored with {self.curriculum_state.epochs_without_improvement} epochs without improvement"
+        )
 
     def train_all_stages(self):
         """
         Run complete adaptive multi-stage training pipeline
-        
+
         This is the main entry point that orchestrates the dynamic curriculum learning
         """
         if Path(self.ROLLING_CHECKPOINT).exists():
@@ -759,35 +910,35 @@ class AdaptiveMultiStageTrainer:
             self.current_epoch = 0
             self.global_epoch = 0
 
-        print("\n" + "="*80)
+        print("\n" + "=" * 80)
         print("ADAPTIVE MULTI-STAGE TRAINING WITH DYNAMIC CURRICULUM")
         print("Novel Training Strategies:")
-        print("• Adaptive Stage Transitioning (Dynamic Curriculum)")  
+        print("• Adaptive Stage Transitioning (Dynamic Curriculum)")
         print("• Topology-aware Loss Scheduling")
         print("• Multi-objective Optimization with Dynamic Weighting")
         print("• Cross-modal Latent Consistency Learning")
         print("• Graph-based Topology Constraints")
-        print("="*80)
+        print("=" * 80)
 
         # Stage 1: Adaptive 2D training
         if self.current_stage <= 1:
             print("\n🚀 STAGE 1: Adaptive 2D Segmentation + Attributes Training")
             self.train_stage_adaptive(
-                stage=1, 
+                stage=1,
                 max_epochs=self.config.max_stage1_epochs,
-                min_epochs=self.config.min_stage1_epochs
+                min_epochs=self.config.min_stage1_epochs,
             )
             self.current_stage = 2
             self.stage_epoch = 0
             print("\nStage 1 completed. Transitioning to Stage 2...")
 
-        # Stage 2: Adaptive DVX training  
+        # Stage 2: Adaptive DVX training
         if self.current_stage <= 2:
             print("\n🔄 STAGE 2: Adaptive DVX Polygon Fitting Training")
             self.train_stage_adaptive(
                 stage=2,
-                max_epochs=self.config.max_stage2_epochs, 
-                min_epochs=self.config.min_stage2_epochs
+                max_epochs=self.config.max_stage2_epochs,
+                min_epochs=self.config.min_stage2_epochs,
             )
             self.current_stage = 3
             self.stage_epoch = 0
@@ -799,13 +950,13 @@ class AdaptiveMultiStageTrainer:
             self.train_stage_adaptive(
                 stage=3,
                 max_epochs=self.config.max_stage3_epochs,
-                min_epochs=self.config.min_stage3_epochs  
+                min_epochs=self.config.min_stage3_epochs,
             )
             print("\nStage 3 completed!")
 
-        print("\n" + "="*80)
+        print("\n" + "=" * 80)
         print("✅ ALL ADAPTIVE TRAINING STAGES COMPLETED!")
-        print("="*80)
+        print("=" * 80)
 
         # Generate training report
         self._generate_training_report()
@@ -817,48 +968,58 @@ class AdaptiveMultiStageTrainer:
         if Path(self.ROLLING_CHECKPOINT).exists():
             Path(self.ROLLING_CHECKPOINT).unlink()
             print(f"Cleaned up rolling checkpoint: {self.ROLLING_CHECKPOINT}")
-        
+
         return self.history
 
     def _generate_training_report(self):
         """Generate comprehensive training report with curriculum insights"""
-        print("\n" + "="*60)
+        print("\n" + "=" * 60)
         print("ADAPTIVE TRAINING REPORT")
-        print("="*60)
-        
+        print("=" * 60)
+
         # Stage transition summary
         if self.history["stage_transitions"]:
             print("\n📊 Stage Transitions:")
             for transition in self.history["stage_transitions"]:
-                print(f"  • Stage {transition['from_stage']} → {transition['from_stage']+1}: "
-                     f"Epoch {transition['epoch']} (Global: {transition['global_epoch']})")
+                print(
+                    f"  • Stage {transition['from_stage']} → {transition['from_stage']+1}: "
+                    f"Epoch {transition['epoch']} (Global: {transition['global_epoch']})"
+                )
                 print(f"    Reason: {transition['reason']}")
-        
+
         # Dynamic weight evolution
         if self.history["dynamic_weights"]:
-            print(f"\n⚖️  Dynamic Weight Updates: {len(self.history['dynamic_weights'])} updates")
+            print(
+                f"\n⚖️  Dynamic Weight Updates: {len(self.history['dynamic_weights'])} updates"
+            )
             final_weights = self.history["dynamic_weights"][-1]["weights"]
             print("  Final loss weights:")
             for name, weight in final_weights.items():
                 if weight > 0.001:
                     print(f"    {name}: {weight:.3f}")
-        
+
         # Curriculum events
         if self.history["curriculum_events"]:
-            print(f"\n🎯 Curriculum Events: {len(self.history['curriculum_events'])} events")
+            print(
+                f"\n🎯 Curriculum Events: {len(self.history['curriculum_events'])} events"
+            )
             for event in self.history["curriculum_events"][-5:]:  # Show last 5 events
-                print(f"  • {event['type']} at global epoch {event['epoch']}: {event['details']}")
-        
+                print(
+                    f"  • {event['type']} at global epoch {event['epoch']}: {event['details']}"
+                )
+
         # Performance summary
         print("\n📈 Final Performance:")
         for stage_name, data in self.history.items():
             if isinstance(data, dict) and "val_loss" in data and data["val_loss"]:
                 final_loss = data["val_loss"][-1]
                 best_loss = min(data["val_loss"])
-                print(f"  • {stage_name.upper()}: Final={final_loss:.4f}, Best={best_loss:.4f}")
-        
+                print(
+                    f"  • {stage_name.upper()}: Final={final_loss:.4f}, Best={best_loss:.4f}"
+                )
+
         print("\n🏁 Training completed with novel adaptive curriculum strategies!")
-        print("="*60)
+        print("=" * 60)
 
     def _save_checkpoint(self, filename):
         """Save final training checkpoint"""
@@ -873,7 +1034,7 @@ class AdaptiveMultiStageTrainer:
             "scaler_state_dict": self.scaler.state_dict(),
             "loss_fn_state": {
                 "weights": self.loss_fn.weights,
-                "initial_weights": self.loss_fn.initial_weights
+                "initial_weights": self.loss_fn.initial_weights,
             },
             "history": self.history,
             "config": self.config,
@@ -883,11 +1044,12 @@ class AdaptiveMultiStageTrainer:
             "curriculum_summary": {
                 "stage_transitions": len(self.history["stage_transitions"]),
                 "weight_updates": len(self.history["dynamic_weights"]),
-                "curriculum_events": len(self.history["curriculum_events"])
-            }
+                "curriculum_events": len(self.history["curriculum_events"]),
+            },
         }
         torch.save(checkpoint, filename)
         print(f"Final model saved: {filename}")
+
 
 # Legacy compatibility class
 class MultiStageTrainer(AdaptiveMultiStageTrainer):
@@ -895,24 +1057,25 @@ class MultiStageTrainer(AdaptiveMultiStageTrainer):
     Legacy wrapper for backward compatibility
     Redirects to the new adaptive trainer
     """
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         print("Note: Using enhanced AdaptiveMultiStageTrainer with dynamic curriculum")
-    
+
     def train_stage1(self, epochs=None):
         """Legacy method - redirects to adaptive training"""
         max_epochs = epochs or self.config.max_stage1_epochs
         min_epochs = self.config.min_stage1_epochs
         return self.train_stage_adaptive(1, max_epochs, min_epochs)
-    
+
     def train_stage2(self, epochs=None):
-        """Legacy method - redirects to adaptive training"""  
+        """Legacy method - redirects to adaptive training"""
         max_epochs = epochs or self.config.max_stage2_epochs
         min_epochs = self.config.min_stage2_epochs
         return self.train_stage_adaptive(2, max_epochs, min_epochs)
-    
+
     def train_stage3(self, epochs=None):
         """Legacy method - redirects to adaptive training"""
-        max_epochs = epochs or self.config.max_stage3_epochs  
+        max_epochs = epochs or self.config.max_stage3_epochs
         min_epochs = self.config.min_stage3_epochs
         return self.train_stage_adaptive(3, max_epochs, min_epochs)
