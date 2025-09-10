@@ -152,7 +152,7 @@ class TrainingConfig:
     gradient_norm_window: int = 10  # rolling window for gradient tracking
     
     # Checkpointing
-    checkpoint_freq: int = 5
+    checkpoint_freq: int = 1
     
     # Curriculum configuration
     curriculum: CurriculumConfig = None
