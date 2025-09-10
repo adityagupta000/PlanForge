@@ -272,6 +272,7 @@ class ResearchGradeLoss(nn.Module):
 
         if "sdf" in predictions and "mask" in targets:
             sdf_pred = predictions["sdf"]
+            sdf_pred = torch.clamp(sdf_pred, -1.0, 1.0)   # FIX: prevent huge values
             sdf_target = self._mask_to_sdf(targets["mask"])
             sdf_target = sdf_target.to(sdf_pred.device).type_as(sdf_pred)
             losses["sdf"] = self.mse_loss(sdf_pred, sdf_target)
@@ -350,6 +351,12 @@ class ResearchGradeLoss(nn.Module):
             for name, loss in losses.items():
                 if name in self.weights:
                     total_loss = total_loss + self.weights[name] * loss
+
+        # Final NaN/Inf guard
+        for k, v in list(losses.items()):
+            if torch.isnan(v).any() or torch.isinf(v).any():
+                print(f"[Warning] {k} loss is NaN/Inf → zeroed out")
+                losses[k] = torch.tensor(0.0, device=device)
 
         losses["total"] = total_loss
         return total_loss, losses
@@ -472,7 +479,7 @@ class ResearchGradeLoss(nn.Module):
         return torch.stack(dice_losses).mean()
 
     def _mask_to_sdf(self, mask: torch.Tensor) -> torch.Tensor:
-        """Convert mask to SDF (preserved from original)"""
+        """Convert mask to SDF with performance warning"""
         device = mask.device if torch.is_tensor(mask) else None
         if not torch.is_tensor(mask):
             mask = torch.tensor(mask, device=device)
@@ -480,8 +487,12 @@ class ResearchGradeLoss(nn.Module):
         B, H, W = mask.shape
         sdf = torch.zeros((B, 1, H, W), dtype=torch.float32, device=device)
 
+        # FIX: Add performance warning for CV2 bottleneck
+        if B > 8:  # Warn for large batches
+            print(f"[Performance Warning] SDF conversion with batch_size={B} uses CPU cv2 - consider GPU implementation")
+
         for b in range(B):
-            mask_np = mask[b].cpu().numpy().astype(np.uint8)
+            mask_np = mask[b].detach().cpu().numpy().astype(np.uint8)  # FIX: explicit detach
             try:
                 dist_inside = cv2.distanceTransform((mask_np > 0).astype(np.uint8), cv2.DIST_L2, 5)
                 dist_outside = cv2.distanceTransform((mask_np == 0).astype(np.uint8), cv2.DIST_L2, 5)
@@ -553,7 +564,7 @@ class ResearchGradeLoss(nn.Module):
 
     def _voxel_iou_loss(self, pred_voxels: torch.Tensor, target_voxels: torch.Tensor) -> torch.Tensor:
         """3D voxel IoU loss (preserved)"""
-        pred_prob = torch.sigmoid(pred_voxels)
+        pred_prob = torch.sigmoid(torch.clamp(pred_voxels, -10.0, 10.0))  # FIX: safe sigmoid range
         target = target_voxels.float().to(pred_prob.device)
 
         intersection = (pred_prob * target).view(pred_prob.shape[0], -1).sum(dim=1)
@@ -679,10 +690,10 @@ class LossScheduler:
                     scheduled_weights[loss_name] = 0.0
                     
             elif schedule_type == "delayed_ramp":
-                # Start after specific epoch (graph constraints)
+                # FIX: gentler ramp for graph constraints
                 if current_epoch >= self.config.graph_start_epoch:
                     epochs_since_start = current_epoch - self.config.graph_start_epoch
-                    ramp_duration = 20  # Ramp over 20 epochs
+                    ramp_duration = 50  # FIX: slower ramp (was 20)
                     progress = min(epochs_since_start / ramp_duration, 1.0)
                     scheduled_weights[loss_name] = self.config.graph_end_weight * progress
                 else:

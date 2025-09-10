@@ -330,10 +330,10 @@ class AdaptiveMultiStageTrainer:
                 self.scaler.unscale_(optimizer)
                 
                 # Apply gradient clipping
-                if mode == "stage2":
-                    torch.nn.utils.clip_grad_norm_(self.model.dvx.parameters(), self.config.grad_clip_norm)
-                else:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip_norm)
+                torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(),
+                self.config.grad_clip_norm
+                )
                 
                 # Optimizer step with scaler
                 self.scaler.step(optimizer)
