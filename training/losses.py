@@ -78,13 +78,28 @@ class DynamicLossWeighter:
         
         avg_grad_norm = sum(grad_norms.values()) / len(grad_norms)
         
+        # APPLY FIXES FROM INSTRUCTION
+        epsilon = 1e-4  # Safeguard against tiny gradients
+        max_target_grad = 100.0  # Upper bound for scaled gradients
+        max_weight_update = 5.0  # Upper bound for weight updates
+        
         for name in self.loss_names:
             if name in grad_norms and name in loss_ratios:
                 target_grad = avg_grad_norm * (loss_ratios[name] ** self.alpha)
-                weight_update = target_grad / (grad_norms[name] + 1e-8)
+                target_grad = min(target_grad, max_target_grad)  # Clamp target gradient
+                
+                safe_grad_norm = max(grad_norms[name], epsilon)  # Avoid near-zero division
+                if safe_grad_norm == epsilon:
+                    print(f"⚠️ Small gradient norm for {name}, clamped to {epsilon}")
+                
+                weight_update = target_grad / safe_grad_norm
+                weight_update = min(weight_update, max_weight_update)  # Clamp weight update
+                if weight_update == max_weight_update:
+                    print(f"⚠️ Weight update for {name} clamped to {max_weight_update}")
+                
                 # Apply momentum-like update
                 new_w = 0.9 * self.weights[name] + 0.1 * float(weight_update)
-                self.weights[name] = float(np.clip(new_w, 0.1, 10.0))  # FIX: always float
+                self.weights[name] = float(np.clip(new_w, 0.1, 5.0))  # Tighter clamping for stability
         
         self.update_count += 1
         return self.weights
