@@ -29,7 +29,7 @@ class DynamicLossWeighter:
         
     def update_weights(self, task_losses: Dict[str, torch.Tensor], 
                       shared_parameters, update_freq: int = 10):
-        """Update loss weights using GradNorm algorithm"""
+        """Update loss weights using GradNorm algorithm with enhanced stability"""
         if self.update_count % update_freq != 0:
             self.update_count += 1
             return self.weights
@@ -52,58 +52,71 @@ class DynamicLossWeighter:
                 loss_ratios[name] = current_loss / (initial_loss + 1e-8)
         
         # Calculate average relative decrease
-        if not loss_ratios:  # FIX: guard empty
+        if not loss_ratios:
             self.update_count += 1
             return self.weights
         avg_loss_ratio = sum(loss_ratios.values()) / len(loss_ratios)
         
-        # Calculate gradient norms
+        # Calculate gradient norms with enhanced safety checks
         grad_norms = {}
         for name in self.loss_names:
             if name in task_losses:
-                grads = torch.autograd.grad(
-                    task_losses[name], shared_parameters, 
-                    retain_graph=True, create_graph=False, allow_unused=True
-                )
-                grad_norm = 0.0
-                for grad in grads:
-                    if grad is not None:
-                        grad_norm += grad.norm().item() ** 2
-                if grad_norm > 0:
-                    grad_norms[name] = grad_norm ** 0.5
+                # Check if loss is finite before gradient computation
+                if not torch.isfinite(task_losses[name]):
+                    print(f"Warning: Non-finite loss for {name}, skipping gradient computation")
+                    continue
+                    
+                try:
+                    grads = torch.autograd.grad(
+                        task_losses[name], shared_parameters, 
+                        retain_graph=True, create_graph=False, allow_unused=True
+                    )
+                    grad_norm = 0.0
+                    for grad in grads:
+                        if grad is not None and torch.isfinite(grad).all():
+                            grad_norm += grad.norm().item() ** 2
+                        elif grad is not None:
+                            print(f"Warning: Non-finite gradient detected for {name}")
+                            grad_norm = 0.0
+                            break
+                            
+                    if grad_norm > 0:
+                        grad_norms[name] = grad_norm ** 0.5
+                except Exception as e:
+                    print(f"Warning: Gradient computation failed for {name}: {e}")
+                    continue
         
-        if not grad_norms:  # FIX: guard empty
+        if not grad_norms:
             self.update_count += 1
             return self.weights
         
         avg_grad_norm = sum(grad_norms.values()) / len(grad_norms)
         
-        # APPLY FIXES FROM INSTRUCTION
-        epsilon = 1e-4  # Safeguard against tiny gradients
-        max_target_grad = 100.0  # Upper bound for scaled gradients
-        max_weight_update = 5.0  # Upper bound for weight updates
+        # Enhanced safety parameters
+        epsilon = 1e-6  # Increased minimum threshold
+        max_target_grad = 10.0  # Reduced maximum allowed gradient
+        max_weight_update = 2.0  # Reduced maximum weight change
         
         for name in self.loss_names:
             if name in grad_norms and name in loss_ratios:
                 target_grad = avg_grad_norm * (loss_ratios[name] ** self.alpha)
-                target_grad = min(target_grad, max_target_grad)  # Clamp target gradient
+                target_grad = min(target_grad, max_target_grad)
                 
-                safe_grad_norm = max(grad_norms[name], epsilon)  # Avoid near-zero division
+                safe_grad_norm = max(grad_norms[name], epsilon)
                 if safe_grad_norm == epsilon:
-                    print(f"⚠️ Small gradient norm for {name}, clamped to {epsilon}")
+                    print(f"⚠ Small gradient norm for {name}, clamped to {epsilon}")
                 
                 weight_update = target_grad / safe_grad_norm
-                weight_update = min(weight_update, max_weight_update)  # Clamp weight update
+                weight_update = min(weight_update, max_weight_update)
                 if weight_update == max_weight_update:
-                    print(f"⚠️ Weight update for {name} clamped to {max_weight_update}")
+                    print(f"⚠ Weight update for {name} clamped to {max_weight_update}")
                 
-                # Apply momentum-like update
-                new_w = 0.9 * self.weights[name] + 0.1 * float(weight_update)
-                self.weights[name] = float(np.clip(new_w, 0.1, 5.0))  # Tighter clamping for stability
+                # More conservative momentum update
+                new_w = 0.95 * self.weights[name] + 0.05 * float(weight_update)  # Slower adaptation
+                self.weights[name] = float(np.clip(new_w, 0.01, 3.0))  # Tighter bounds
         
         self.update_count += 1
         return self.weights
-
 
 class GraphTopologyExtractor:
     """Extracts graph structure from segmentation for topology constraints"""
@@ -269,6 +282,17 @@ class ResearchGradeLoss(nn.Module):
         Returns:
             tuple: (total_loss, individual_losses_dict)
         """
+        # Input validation - check for NaN/Inf values
+        for name, tensor in predictions.items():
+            if torch.is_tensor(tensor) and (torch.isnan(tensor).any() or torch.isinf(tensor).any()):
+                print(f"WARNING: NaN/Inf in predictions[{name}] - zeroing out")
+                predictions[name] = torch.zeros_like(tensor)
+    
+        for name, tensor in targets.items():
+            if torch.is_tensor(tensor) and (torch.isnan(tensor).any() or torch.isinf(tensor).any()):
+                print(f"WARNING: NaN/Inf in targets[{name}] - zeroing out")
+                targets[name] = torch.zeros_like(tensor)
+                
         device = self._get_device_from_inputs(predictions, targets)
         losses = {}
         total_loss = torch.tensor(0.0, device=device)

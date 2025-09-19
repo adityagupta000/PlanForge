@@ -132,13 +132,13 @@ class TrainingConfig:
     min_stage3_epochs: int = 12
     
     # Learning rates (per stage)
-    stage1_lr: float = 3e-4
+    stage1_lr: float = 1e-5  # was 3e-4
     stage1_weight_decay: float = 1e-5
     
-    stage2_lr: float = 1e-4
+    stage2_lr: float = 5e-6  # was 1e-4 
     stage2_weight_decay: float = 1e-5
     
-    stage3_lr: float = 5e-5
+    stage3_lr: float = 1e-6  # was 5e-5
     stage3_weight_decay: float = 1e-5
     
     # Advanced training techniques

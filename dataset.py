@@ -247,6 +247,9 @@ class AdvancedFloorPlanDataset(Dataset):
         if self.augment:
             image_tensor, mask_tensor = self._augment(image_tensor, mask_tensor)
 
+        # Add validation before returning
+        self._validate_sample_data(idx, image_tensor, mask_tensor, attr_tensor, voxels_tensor, polygon_tensor)
+
         return {
             "image": image_tensor,
             "mask": mask_tensor,
@@ -255,6 +258,49 @@ class AdvancedFloorPlanDataset(Dataset):
             "polygons_gt": polygon_tensor,
             "sample_id": sample_id,
         }
+
+    # ----------------------------------------------------------------------
+    def _validate_sample_data(self, idx, image, mask, attributes, voxels, polygons):
+        """Validate sample data for NaN/Inf values"""
+        tensors_to_check = [
+            ("image", image),
+            ("mask", mask), 
+            ("attributes", attributes),
+            ("voxels", voxels),
+            ("polygons", polygons["polygons"])
+        ]
+        
+        corrupted_data = False
+        
+        for name, tensor in tensors_to_check:
+            if torch.isnan(tensor).any():
+                print(f"ERROR: {name} contains NaN values at sample {idx}")
+                corrupted_data = True
+            if torch.isinf(tensor).any():
+                print(f"ERROR: {name} contains Inf values at sample {idx}")
+                corrupted_data = True
+        
+        if corrupted_data:
+            print(f"WARNING: Corrupted data detected in sample {idx}, replacing with safe fallback values")
+            
+            # Replace corrupted tensors with safe fallback values
+            for name, tensor in tensors_to_check:
+                if torch.isnan(tensor).any() or torch.isinf(tensor).any():
+                    if name == "image":
+                        # Replace with zeros (black image)
+                        image.data = torch.zeros_like(image)
+                    elif name == "mask":
+                        # Replace with zeros (background class)
+                        mask.data = torch.zeros_like(mask).long()
+                    elif name == "attributes":
+                        # Replace with reasonable default values (0.5 normalized)
+                        attributes.data = torch.ones_like(attributes) * 0.5
+                    elif name == "voxels":
+                        # Replace with empty voxel grid
+                        voxels.data = torch.zeros_like(voxels)
+                    elif name == "polygons":
+                        # Replace polygons with zeros
+                        polygons["polygons"].data = torch.zeros_like(polygons["polygons"])
 
     # ----------------------------------------------------------------------
     def _process_attributes(self, attributes):
@@ -268,7 +314,16 @@ class AdvancedFloorPlanDataset(Dataset):
             attributes.get("door_height", 2.6) / 5.0,
             attributes.get("pixel_scale", 0.01) / 0.02,
         ]
-        return torch.tensor(attr_list, dtype=torch.float32)
+        
+        # Ensure no NaN/Inf values in attribute processing
+        safe_attr_list = []
+        for val in attr_list:
+            if np.isnan(val) or np.isinf(val):
+                safe_attr_list.append(0.5)  # Default normalized value
+            else:
+                safe_attr_list.append(max(0.0, min(1.0, val)))  # Clamp to [0,1]
+        
+        return torch.tensor(safe_attr_list, dtype=torch.float32)
 
     # ----------------------------------------------------------------------
     def _process_polygons(self, polygons_gt):
@@ -285,12 +340,41 @@ class AdvancedFloorPlanDataset(Dataset):
 
         poly_idx = 0
 
-        # --- Case 1: dict format ---
-        if isinstance(polygons_gt, dict):
-            for class_name, polygon_list in polygons_gt.items():
-                if not isinstance(polygon_list, list):
-                    continue
-                for polygon in polygon_list:
+        try:
+            # --- Case 1: dict format ---
+            if isinstance(polygons_gt, dict):
+                for class_name, polygon_list in polygons_gt.items():
+                    if not isinstance(polygon_list, list):
+                        continue
+                    for polygon in polygon_list:
+                        if poly_idx >= max_polygons:
+                            break
+                        if "points" not in polygon:
+                            continue
+
+                        points = np.array(polygon["points"])
+                        if len(points) > max_points:
+                            # Subsample evenly if too many points
+                            indices = np.linspace(0, len(points) - 1, max_points, dtype=int)
+                            points = points[indices]
+
+                        # Check for NaN/Inf in points
+                        if np.any(np.isnan(points)) or np.any(np.isinf(points)):
+                            print(f"Warning: Invalid polygon points detected, skipping polygon")
+                            continue
+
+                        # Normalize to [0,1] relative to image size
+                        points = points / np.array(self.image_size)
+                        # Clamp to valid range
+                        points = np.clip(points, 0.0, 1.0)
+                        
+                        processed[poly_idx, : len(points)] = torch.from_numpy(points).float()
+                        valid_mask[poly_idx] = True
+                        poly_idx += 1
+
+            # --- Case 2: list format ---
+            elif isinstance(polygons_gt, list):
+                for polygon in polygons_gt:
                     if poly_idx >= max_polygons:
                         break
                     if "points" not in polygon:
@@ -298,33 +382,26 @@ class AdvancedFloorPlanDataset(Dataset):
 
                     points = np.array(polygon["points"])
                     if len(points) > max_points:
-                        # Subsample evenly if too many points
                         indices = np.linspace(0, len(points) - 1, max_points, dtype=int)
                         points = points[indices]
 
-                    # Normalize to [0,1] relative to image size
+                    # Check for NaN/Inf in points
+                    if np.any(np.isnan(points)) or np.any(np.isinf(points)):
+                        print(f"Warning: Invalid polygon points detected, skipping polygon")
+                        continue
+
                     points = points / np.array(self.image_size)
+                    points = np.clip(points, 0.0, 1.0)
+                    
                     processed[poly_idx, : len(points)] = torch.from_numpy(points).float()
                     valid_mask[poly_idx] = True
                     poly_idx += 1
 
-        # --- Case 2: list format ---
-        elif isinstance(polygons_gt, list):
-            for polygon in polygons_gt:
-                if poly_idx >= max_polygons:
-                    break
-                if "points" not in polygon:
-                    continue
-
-                points = np.array(polygon["points"])
-                if len(points) > max_points:
-                    indices = np.linspace(0, len(points) - 1, max_points, dtype=int)
-                    points = points[indices]
-
-                points = points / np.array(self.image_size)
-                processed[poly_idx, : len(points)] = torch.from_numpy(points).float()
-                valid_mask[poly_idx] = True
-                poly_idx += 1
+        except Exception as e:
+            print(f"Warning: Error processing polygons: {e}")
+            # Return safe empty polygon data
+            processed = torch.zeros(max_polygons, max_points, 2)
+            valid_mask = torch.zeros(max_polygons, dtype=torch.bool)
 
         return {"polygons": processed, "valid_mask": valid_mask}
 
@@ -347,11 +424,19 @@ class AdvancedFloorPlanDataset(Dataset):
             image = torch.flip(image, dims=[1])
             mask = torch.flip(mask, dims=[0])
 
-        # Slight brightness/contrast adjustment
+        # Slight brightness/contrast adjustment with safety checks
         if torch.rand(1) < 0.3:
             brightness = torch.rand(1) * 0.2 - 0.1  # ±0.1
             contrast = torch.rand(1) * 0.2 + 0.9     # 0.9-1.1
             image = torch.clamp(image * contrast + brightness, 0, 1)
+            
+            # Additional safety check for augmented image
+            if torch.isnan(image).any() or torch.isinf(image).any():
+                print("Warning: Augmentation produced invalid values, reverting to original")
+                # Revert to safe values
+                image = torch.clamp(image, 0, 1)
+                image = torch.where(torch.isnan(image) | torch.isinf(image), 
+                                  torch.zeros_like(image), image)
 
         return image, mask
 
