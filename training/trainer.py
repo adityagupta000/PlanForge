@@ -749,97 +749,179 @@ class AdaptiveMultiStageTrainer:
         print(f"Rolling checkpoint saved: {checkpoint_path}")
 
     def load_checkpoint(self, filename):
-        """Enhanced checkpoint loading with curriculum state restoration and device handling"""
-        checkpoint = torch.load(filename, map_location=self.device)
+        """
+        Enhanced checkpoint loading with architecture compatibility handling
+        Safely handles model architecture changes by filtering incompatible parameters
+        """
+        print(f"Loading checkpoint: {filename}")
+        checkpoint = torch.load(filename, map_location=self.device, weights_only=False)
 
-        self.model.load_state_dict(checkpoint["model_state_dict"])
-        self.optimizer_2d.load_state_dict(checkpoint["optimizer_2d_state_dict"])
-        self.optimizer_dvx.load_state_dict(checkpoint["optimizer_dvx_state_dict"])
-        self.optimizer_full.load_state_dict(checkpoint["optimizer_full_state_dict"])
+        # === SAFE MODEL STATE LOADING ===
+        model_state = checkpoint["model_state_dict"]
+        current_model_keys = set(self.model.state_dict().keys())
+        
+        # Filter parameters into compatible and incompatible
+        compatible_state = {}
+        incompatible_keys = []
+        missing_keys = []
+        
+        # Check each parameter in the checkpoint
+        for key, value in model_state.items():
+            if key in current_model_keys:
+                # Check if tensor shapes match
+                current_param = self.model.state_dict()[key]
+                if current_param.shape == value.shape:
+                    compatible_state[key] = value
+                else:
+                    incompatible_keys.append(f"{key} (shape mismatch: {value.shape} -> {current_param.shape})")
+            else:
+                incompatible_keys.append(f"{key} (parameter not found in current model)")
+        
+        # Check for missing parameters in checkpoint
+        for key in current_model_keys:
+            if key not in model_state:
+                missing_keys.append(key)
+        
+        # Load compatible parameters only
+        loaded_keys, unexpected_keys = self.model.load_state_dict(compatible_state, strict=False)
+        
+        # Report parameter loading status
+        print(f"✓ Successfully loaded {len(compatible_state)} compatible parameters")
+        
+        if incompatible_keys:
+            print(f"⚠ Skipped {len(incompatible_keys)} incompatible parameters:")
+            for key in incompatible_keys[:10]:  # Show first 10
+                print(f"    - {key}")
+            if len(incompatible_keys) > 10:
+                print(f"    ... and {len(incompatible_keys) - 10} more")
+        
+        if missing_keys:
+            print(f"⚠ {len(missing_keys)} parameters will use random initialization:")
+            for key in missing_keys[:10]:  # Show first 10
+                print(f"    - {key}")
+            if len(missing_keys) > 10:
+                print(f"    ... and {len(missing_keys) - 10} more")
 
-        # Load scaler state for AMP
+        # === OPTIMIZER STATES LOADING ===
+        try:
+            self.optimizer_2d.load_state_dict(checkpoint["optimizer_2d_state_dict"])
+            print("✓ Loaded optimizer_2d state")
+        except Exception as e:
+            print(f"⚠ Could not load optimizer_2d state: {e}")
+
+        try:
+            self.optimizer_dvx.load_state_dict(checkpoint["optimizer_dvx_state_dict"])
+            print("✓ Loaded optimizer_dvx state")
+        except Exception as e:
+            print(f"⚠ Could not load optimizer_dvx state: {e}")
+
+        try:
+            self.optimizer_full.load_state_dict(checkpoint["optimizer_full_state_dict"])
+            print("✓ Loaded optimizer_full state")
+        except Exception as e:
+            print(f"⚠ Could not load optimizer_full state: {e}")
+
+        # === AMP SCALER STATE ===
         if "scaler_state_dict" in checkpoint:
-            self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
+            try:
+                self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
+                print("✓ Loaded AMP scaler state")
+            except Exception as e:
+                print(f"⚠ Could not load scaler state: {e}")
 
-        # Safer scheduler loading
-        for sched_key, sched_obj in [
+        # === SCHEDULER STATES ===
+        scheduler_mappings = [
             ("scheduler_2d_state_dict", self.scheduler_2d),
             ("scheduler_dvx_state_dict", self.scheduler_dvx),
             ("scheduler_full_state_dict", self.scheduler_full),
-        ]:
-            if sched_key in checkpoint:
-                sched_obj.load_state_dict(checkpoint[sched_key])
+        ]
+        
+        for state_key, scheduler_obj in scheduler_mappings:
+            if state_key in checkpoint:
+                try:
+                    scheduler_obj.load_state_dict(checkpoint[state_key])
+                    print(f"✓ Loaded {state_key.replace('_state_dict', '')} scheduler")
+                except Exception as e:
+                    print(f"⚠ Could not load {state_key}: {e}")
 
-        # Load loss weights with proper device handling
+        # === LOSS FUNCTION STATE ===
         if "loss_fn_state" in checkpoint:
-            loaded_weights = checkpoint["loss_fn_state"]["weights"]
-            if isinstance(loaded_weights, dict):
-                self.loss_fn.weights = {
-                    k: (v.to(self.device) if torch.is_tensor(v) else v)
-                    for k, v in loaded_weights.items()
-                }
-            else:
-                self.loss_fn.weights = loaded_weights
-            self.loss_fn.initial_weights = checkpoint["loss_fn_state"][
-                "initial_weights"
-            ]
+            try:
+                loaded_weights = checkpoint["loss_fn_state"]["weights"]
+                if isinstance(loaded_weights, dict):
+                    # Handle device transfer for tensor weights
+                    self.loss_fn.weights = {
+                        k: (v.to(self.device) if torch.is_tensor(v) else v)
+                        for k, v in loaded_weights.items()
+                    }
+                else:
+                    self.loss_fn.weights = loaded_weights
+                
+                self.loss_fn.initial_weights = checkpoint["loss_fn_state"]["initial_weights"]
+                print("✓ Loaded loss function weights")
+            except Exception as e:
+                print(f"⚠ Could not load loss function state: {e}")
 
+        # === TRAINING HISTORY ===
         if "history" in checkpoint:
             self.history = checkpoint["history"]
+            print("✓ Loaded training history")
 
-        # Restore training state
-        if "current_stage" in checkpoint:
-            self.current_stage = checkpoint["current_stage"]
-        if "current_epoch" in checkpoint:
-            self.current_epoch = checkpoint["current_epoch"]
-        if "global_epoch" in checkpoint:
-            self.global_epoch = checkpoint["global_epoch"]
-        if "stage_epoch" in checkpoint:
-            self.stage_epoch = checkpoint["stage_epoch"]
-        if "epoch_times" in checkpoint:
-            self.epoch_times = checkpoint["epoch_times"]
-        if "step_counter" in checkpoint:
-            self._step = checkpoint["step_counter"]
+        # === TRAINING STATE VARIABLES ===
+        state_variables = [
+            ("current_stage", "current_stage"),
+            ("current_epoch", "current_epoch"), 
+            ("global_epoch", "global_epoch"),
+            ("stage_epoch", "stage_epoch"),
+            ("epoch_times", "epoch_times"),
+            ("step_counter", "_step"),
+        ]
+        
+        for checkpoint_key, attr_name in state_variables:
+            if checkpoint_key in checkpoint:
+                setattr(self, attr_name, checkpoint[checkpoint_key])
+                print(f"✓ Restored {checkpoint_key}: {getattr(self, attr_name)}")
 
-        # Restore curriculum state
+        # === CURRICULUM STATE RESTORATION ===
         if "curriculum_state" in checkpoint:
-            cs = checkpoint["curriculum_state"]
-            for key, history in cs["loss_history"].items():
-                self.curriculum_state.loss_history[key] = deque(
-                    history, maxlen=self.config.curriculum.plateau_detection_window * 2
-                )
-            for key, history in cs["component_losses"].items():
-                self.curriculum_state.component_losses[key] = deque(history, maxlen=20)
-            self.curriculum_state.epochs_without_improvement = cs.get(
-                "epochs_without_improvement", 0
-            )
-            self.curriculum_state.best_val_loss = cs.get("best_val_loss", float("inf"))
-            self.curriculum_state.stage_transition_epochs = cs.get(
-                "stage_transition_epochs", []
-            )
-
-        # Restore RNG states
-        if "rng_state" in checkpoint:
-            rs = checkpoint["rng_state"]
-
-            # --- Torch RNG (CPU) ---
             try:
-                torch_state = rs.get("torch", None)
-                if torch_state is not None:
-                    # If it's already a torch tensor with uint8 dtype, use directly
+                cs = checkpoint["curriculum_state"]
+                
+                # Restore loss history deques
+                for key, history in cs.get("loss_history", {}).items():
+                    self.curriculum_state.loss_history[key] = deque(
+                        history, maxlen=self.config.curriculum.plateau_detection_window * 2
+                    )
+                
+                # Restore component loss deques
+                for key, history in cs.get("component_losses", {}).items():
+                    self.curriculum_state.component_losses[key] = deque(history, maxlen=20)
+                
+                # Restore curriculum metrics
+                self.curriculum_state.epochs_without_improvement = cs.get("epochs_without_improvement", 0)
+                self.curriculum_state.best_val_loss = cs.get("best_val_loss", float("inf"))
+                self.curriculum_state.stage_transition_epochs = cs.get("stage_transition_epochs", [])
+                
+                print("✓ Restored curriculum learning state")
+            except Exception as e:
+                print(f"⚠ Could not restore curriculum state: {e}")
+
+        # === RNG STATE RESTORATION ===
+        if "rng_state" in checkpoint:
+            try:
+                rs = checkpoint["rng_state"]
+
+                # Torch RNG (CPU)
+                if "torch" in rs and rs["torch"] is not None:
+                    torch_state = rs["torch"]
                     if torch.is_tensor(torch_state) and torch_state.dtype == torch.uint8:
                         torch.set_rng_state(torch_state)
                     else:
-                        # Convert lists / numpy arrays / other tensors to uint8 torch tensor
                         torch.set_rng_state(torch.tensor(torch_state, dtype=torch.uint8))
-            except Exception as e:
-                print(f"Warning: could not restore torch RNG state ({e}), skipping.")
 
-            # --- CUDA RNG (all devices) ---
-            try:
-                cuda_state = rs.get("cuda", None)
-                if cuda_state is not None and torch.cuda.is_available():
-                    # cuda_state might be a list of states (one per device)
+                # CUDA RNG (all devices)
+                if "cuda" in rs and rs["cuda"] is not None and torch.cuda.is_available():
+                    cuda_state = rs["cuda"]
                     cuda_tensors = []
                     for s in cuda_state:
                         if torch.is_tensor(s) and s.dtype == torch.uint8:
@@ -847,52 +929,57 @@ class AdaptiveMultiStageTrainer:
                         else:
                             cuda_tensors.append(torch.tensor(s, dtype=torch.uint8))
                     torch.cuda.set_rng_state_all(cuda_tensors)
-            except Exception as e:
-                print(f"Warning: could not restore CUDA RNG state ({e}), skipping.")
 
-            # --- numpy RNG ---
-            try:
+                # NumPy RNG
                 if "numpy" in rs and rs["numpy"] is not None:
                     np.random.set_state(rs["numpy"])
-            except Exception as e:
-                print(f"Warning: could not restore numpy RNG state ({e}), skipping.")
 
-            # --- python random RNG ---
-            try:
+                # Python random RNG
                 if "python" in rs and rs["python"] is not None:
                     random.setstate(rs["python"])
+
+                print("✓ Restored RNG states for reproducibility")
             except Exception as e:
-                print(f"Warning: could not restore python RNG state ({e}), skipping.")
+                print(f"⚠ Could not restore RNG states: {e}")
 
-        # Restore DataLoader sampler states if available
+        # === DATALOADER STATE (if available) ===
         if "dataloader_state" in checkpoint:
-            dl_state = checkpoint["dataloader_state"]
-            if dl_state["train_sampler_state"] is not None and hasattr(
-                self.train_loader.sampler, "__dict__"
-            ):
-                try:
-                    self.train_loader.sampler.__dict__.update(
-                        dl_state["train_sampler_state"]
-                    )
-                except Exception:
-                    print("Warning: Could not restore train_loader sampler state")
-            if dl_state["val_sampler_state"] is not None and hasattr(
-                self.val_loader.sampler, "__dict__"
-            ):
-                try:
-                    self.val_loader.sampler.__dict__.update(
-                        dl_state["val_sampler_state"]
-                    )
-                except Exception:
-                    print("Warning: Could not restore val_loader sampler state")
+            try:
+                dl_state = checkpoint["dataloader_state"]
+                if (dl_state.get("train_sampler_state") is not None and 
+                    hasattr(self.train_loader.sampler, "__dict__")):
+                    self.train_loader.sampler.__dict__.update(dl_state["train_sampler_state"])
+                
+                if (dl_state.get("val_sampler_state") is not None and 
+                    hasattr(self.val_loader.sampler, "__dict__")):
+                    self.val_loader.sampler.__dict__.update(dl_state["val_sampler_state"])
+                
+                print("✓ Restored dataloader sampler states")
+            except Exception as e:
+                print(f"⚠ Could not restore dataloader states: {e}")
 
-        print(f"Checkpoint loaded: {filename}")
-        print(
-            f"Resuming from Stage {self.current_stage}, Global Epoch {self.global_epoch}"
-        )
-        print(
-            f"Curriculum state restored with {self.curriculum_state.epochs_without_improvement} epochs without improvement"
-        )
+        # === FINAL REPORT ===
+        print("\n" + "="*60)
+        print("CHECKPOINT LOADING SUMMARY")
+        print("="*60)
+        print(f"✓ Checkpoint loaded: {filename}")
+        print(f"✓ Resuming from Stage {self.current_stage}, Global Epoch {self.global_epoch}")
+        print(f"✓ Model parameters: {len(compatible_state)}/{len(model_state)} loaded successfully")
+        
+        if hasattr(self, 'curriculum_state'):
+            print(f"✓ Curriculum state: {self.curriculum_state.epochs_without_improvement} epochs without improvement")
+        
+        if incompatible_keys:
+            print(f"⚠ Architecture changes detected: {len(incompatible_keys)} parameters skipped")
+            print("  This is normal after model architecture updates.")
+        
+        if missing_keys:
+            print(f"⚠ New parameters detected: {len(missing_keys)} will use random initialization")
+            print("  These will be learned quickly during resumed training.")
+        
+        print("="*60)
+        print("Ready to resume adaptive multi-stage training!")
+        print("="*60)
 
     def train_all_stages(self):
         """
