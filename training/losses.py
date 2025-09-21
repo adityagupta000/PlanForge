@@ -2,6 +2,7 @@
 Advanced loss functions for multi-task training with dynamic weighting
 Enhanced with cross-modal consistency, graph constraints, and GradNorm
 Modified to support conditional geometric losses via run_full_geometric flag
+FIXED: Dynamic loss component initialization for stage transitions
 """
 
 import torch
@@ -14,94 +15,135 @@ import networkx as nx
 
 
 class DynamicLossWeighter:
-    """Implements GradNorm and other dynamic weighting strategies"""
+    """Implements GradNorm and other dynamic weighting strategies with stage-aware initialization"""
     
     def __init__(self, loss_names: List[str], alpha: float = 0.12, device: str = 'cuda'):
         self.loss_names = loss_names
         self.alpha = alpha
         self.device = device
         
-        # Initialize weights
-        self.weights = {name: 1.0 for name in loss_names}  # FIX: keep floats, easier logging
-        self.initial_task_losses = None
+        # Initialize weights for all known loss components
+        self.weights = {name: 1.0 for name in loss_names}
+        self.initial_task_losses = {}  # Will be populated dynamically as losses appear
         self.running_mean_losses = {name: 0.0 for name in loss_names}
         self.update_count = 0
         
+        print(f"[DynamicWeighter] Initialized with loss components: {loss_names}")
+        
     def update_weights(self, task_losses: Dict[str, torch.Tensor], 
                       shared_parameters, update_freq: int = 10):
-        """Update loss weights using GradNorm algorithm with enhanced stability"""
+        """Update loss weights using GradNorm algorithm with stage-aware initialization"""
         if self.update_count % update_freq != 0:
             self.update_count += 1
             return self.weights
-            
-        # Store initial losses on first update
-        if self.initial_task_losses is None:
-            self.initial_task_losses = {name: loss.item() for name, loss in task_losses.items()}
-            
-        # Update running mean
-        for name, loss in task_losses.items():
-            self.running_mean_losses[name] = (0.9 * self.running_mean_losses[name] + 
-                                            0.1 * loss.item())
         
-        # Calculate relative decrease rates
+        # === STAGE-AWARE DYNAMIC INITIALIZATION ===
+        # Initialize tracking for any new loss components that appear during stage transitions
+        newly_initialized = []
+        for name, loss in task_losses.items():
+            if name not in self.initial_task_losses:
+                loss_val = loss.item() if torch.is_tensor(loss) else float(loss)
+                # Use absolute value and ensure non-zero for numerical stability
+                self.initial_task_losses[name] = max(abs(loss_val), 1e-6)
+                
+                # Initialize weights and running means for new components
+                if name not in self.weights:
+                    self.weights[name] = 1.0
+                if name not in self.running_mean_losses:
+                    self.running_mean_losses[name] = loss_val
+                    
+                newly_initialized.append(name)
+        
+        if newly_initialized:
+            print(f"[DynamicWeighter] Stage transition detected - initialized new losses: {newly_initialized}")
+            for name in newly_initialized:
+                print(f"  • {name}: initial_value={self.initial_task_losses[name]:.6f}")
+        
+        # Update running mean - only for losses present in current batch
+        for name, loss in task_losses.items():
+            loss_val = loss.item() if torch.is_tensor(loss) else float(loss)
+            if name in self.running_mean_losses:
+                self.running_mean_losses[name] = (0.9 * self.running_mean_losses[name] + 
+                                                0.1 * loss_val)
+            else:
+                # Fallback for completely new loss (shouldn't happen with above init)
+                self.running_mean_losses[name] = loss_val
+        
+        # Calculate relative decrease rates - only for active losses with valid initial values
         loss_ratios = {}
-        for name in self.loss_names:
-            if name in task_losses:
-                current_loss = self.running_mean_losses[name]
+        for name, loss in task_losses.items():
+            if name in self.initial_task_losses and self.initial_task_losses[name] > 0:
+                current_loss = self.running_mean_losses.get(name, loss.item())
                 initial_loss = self.initial_task_losses[name]
                 loss_ratios[name] = current_loss / (initial_loss + 1e-8)
         
-        # Calculate average relative decrease
+        # Skip update if no valid loss ratios
         if not loss_ratios:
+            print(f"[DynamicWeighter] No valid loss ratios computed, skipping weight update")
             self.update_count += 1
             return self.weights
+        
         avg_loss_ratio = sum(loss_ratios.values()) / len(loss_ratios)
         
-        # Calculate gradient norms with enhanced safety checks
+        # Calculate gradient norms with enhanced safety - only for losses with valid ratios
         grad_norms = {}
-        for name in self.loss_names:
-            if name in task_losses:
-                # Check if loss is finite before gradient computation
-                if not torch.isfinite(task_losses[name]):
+        for name, loss in task_losses.items():
+            if name in loss_ratios:
+                # Verify loss is differentiable and finite
+                if not torch.is_tensor(loss) or not loss.requires_grad:
+                    continue
+                if not torch.isfinite(loss):
                     print(f"Warning: Non-finite loss for {name}, skipping gradient computation")
                     continue
                     
                 try:
                     grads = torch.autograd.grad(
-                        task_losses[name], shared_parameters, 
+                        loss, shared_parameters, 
                         retain_graph=True, create_graph=False, allow_unused=True
                     )
-                    grad_norm = 0.0
+                    
+                    grad_norm_sq = 0.0
+                    valid_grads = False
                     for grad in grads:
-                        if grad is not None and torch.isfinite(grad).all():
-                            grad_norm += grad.norm().item() ** 2
-                        elif grad is not None:
-                            print(f"Warning: Non-finite gradient detected for {name}")
-                            grad_norm = 0.0
-                            break
-                            
-                    if grad_norm > 0:
-                        grad_norms[name] = grad_norm ** 0.5
+                        if grad is not None:
+                            if torch.isfinite(grad).all():
+                                grad_norm_sq += grad.norm().item() ** 2
+                                valid_grads = True
+                            else:
+                                print(f"Warning: Non-finite gradient detected for {name}")
+                                grad_norm_sq = 0.0
+                                valid_grads = False
+                                break
+                    
+                    if valid_grads and grad_norm_sq > 0:
+                        grad_norms[name] = grad_norm_sq ** 0.5
+                        
                 except Exception as e:
                     print(f"Warning: Gradient computation failed for {name}: {e}")
                     continue
         
+        # Skip update if no valid gradients
         if not grad_norms:
+            print(f"[DynamicWeighter] No valid gradients computed, skipping weight update")
             self.update_count += 1
             return self.weights
         
         avg_grad_norm = sum(grad_norms.values()) / len(grad_norms)
         
-        # Enhanced safety parameters
-        epsilon = 1e-6  # Increased minimum threshold
-        max_target_grad = 10.0  # Reduced maximum allowed gradient
-        max_weight_update = 2.0  # Reduced maximum weight change
+        # Safety parameters for stable training
+        epsilon = 1e-6
+        max_target_grad = 10.0  
+        max_weight_update = 2.0
         
-        for name in self.loss_names:
-            if name in grad_norms and name in loss_ratios:
+        # Update weights using GradNorm formula - only for losses with valid gradients
+        weights_updated = []
+        for name in grad_norms.keys():
+            if name in loss_ratios:
+                # Compute target gradient
                 target_grad = avg_grad_norm * (loss_ratios[name] ** self.alpha)
                 target_grad = min(target_grad, max_target_grad)
                 
+                # Compute weight update
                 safe_grad_norm = max(grad_norms[name], epsilon)
                 if safe_grad_norm == epsilon:
                     print(f"⚠ Small gradient norm for {name}, clamped to {epsilon}")
@@ -111,12 +153,35 @@ class DynamicLossWeighter:
                 if weight_update == max_weight_update:
                     print(f"⚠ Weight update for {name} clamped to {max_weight_update}")
                 
-                # More conservative momentum update
-                new_w = 0.95 * self.weights[name] + 0.05 * float(weight_update)  # Slower adaptation
-                self.weights[name] = float(np.clip(new_w, 0.01, 3.0))  # Tighter bounds
+                # Conservative momentum-based update
+                current_weight = self.weights.get(name, 1.0)
+                new_weight = 0.95 * current_weight + 0.05 * float(weight_update)
+                self.weights[name] = float(np.clip(new_weight, 0.01, 3.0))
+                
+                weights_updated.append(name)
+        
+        if weights_updated:
+            print(f"[DynamicWeighter] Updated weights for: {weights_updated}")
         
         self.update_count += 1
         return self.weights
+
+    def get_current_weights(self):
+        """Get current weights for all tracked components"""
+        return self.weights.copy()
+
+    def get_initialization_status(self):
+        """Get status of loss component initialization"""
+        return {
+            "initialized_losses": list(self.initial_task_losses.keys()),
+            "all_weights": self.weights.copy(),
+            "update_count": self.update_count
+        }
+
+    def reset_for_stage(self, stage_name):
+        """Optional method for explicit stage resets (not needed with dynamic init)"""
+        print(f"[DynamicWeighter] Stage transition to {stage_name} - dynamic initialization will handle new losses")
+
 
 class GraphTopologyExtractor:
     """Extracts graph structure from segmentation for topology constraints"""
@@ -174,6 +239,11 @@ class GraphTopologyExtractor:
                 # Fallback if scipy not available
                 adj_tensor = torch.zeros((1, 1), device=device)
                 centroids_tensor = torch.zeros((0, 2), device=device)
+            except Exception as e:
+                # General fallback for any other issues
+                print(f"Warning: Graph extraction failed: {e}")
+                adj_tensor = torch.zeros((1, 1), device=device)
+                centroids_tensor = torch.zeros((0, 2), device=device)
             
             adjacency_matrices.append(adj_tensor)
             room_features.append(centroids_tensor)
@@ -203,12 +273,12 @@ class GraphTopologyExtractor:
 
 class ResearchGradeLoss(nn.Module):
     """
-    Multi-task loss combining:
-    - Traditional losses (segmentation, SDF, attributes, polygons, voxels, topology)
-    - NEW: Cross-modal latent consistency
-    - NEW: Graph-based topology constraints  
-    - NEW: Dynamic loss weighting via GradNorm
-    - NEW: Conditional geometric losses based on run_full_geometric flag
+    Multi-task loss with stage-aware dynamic weighting:
+    - Stage 1: segmentation, dice, sdf, attributes, topology, graph
+    - Stage 2: + polygon (DVX)
+    - Stage 3: + voxel, latent_consistency (full geometric)
+    
+    FIXED: Dynamic initialization handles new loss components during stage transitions
     """
 
     def __init__(
@@ -230,7 +300,7 @@ class ResearchGradeLoss(nn.Module):
     ):
         super().__init__()
 
-        # Store initial weights
+        # Store initial weights for all possible loss components
         self.initial_weights = {
             'seg': float(seg_weight),
             'dice': float(dice_weight), 
@@ -252,14 +322,16 @@ class ResearchGradeLoss(nn.Module):
         self.l1_loss = nn.L1Loss()
         self.cosine_loss = nn.CosineEmbeddingLoss()
         
-        # Dynamic weighting
+        # Dynamic weighting with all possible loss names
         self.enable_dynamic_weighting = enable_dynamic_weighting
         if enable_dynamic_weighting:
+            all_loss_names = list(self.initial_weights.keys())
             self.loss_weighter = DynamicLossWeighter(
-                list(self.initial_weights.keys()), alpha=gradnorm_alpha, device=device,
+                all_loss_names, alpha=gradnorm_alpha, device=device,
             )
-            self.loss_weighter.update_freq = weight_update_freq
-            self.loss_weighter.momentum = weight_momentum
+            self.update_freq = weight_update_freq
+            self.momentum = weight_momentum
+            print(f"[ResearchGradeLoss] Dynamic weighting enabled for: {all_loss_names}")
         
         self.device = device
     
@@ -271,7 +343,7 @@ class ResearchGradeLoss(nn.Module):
 
     def forward(self, predictions: dict, targets: dict, shared_parameters=None, run_full_geometric=True):
         """
-        Compute multi-task loss with conditional geometric computation and dynamic weighting.
+        Compute multi-task loss with conditional geometric computation and stage-aware dynamic weighting.
         
         Args:
             predictions: Model predictions dict
@@ -282,36 +354,28 @@ class ResearchGradeLoss(nn.Module):
         Returns:
             tuple: (total_loss, individual_losses_dict)
         """
-        # Input validation - check for NaN/Inf values
-        for name, tensor in predictions.items():
-            if torch.is_tensor(tensor) and (torch.isnan(tensor).any() or torch.isinf(tensor).any()):
-                print(f"WARNING: NaN/Inf in predictions[{name}] - zeroing out")
-                predictions[name] = torch.zeros_like(tensor)
-    
-        for name, tensor in targets.items():
-            if torch.is_tensor(tensor) and (torch.isnan(tensor).any() or torch.isinf(tensor).any()):
-                print(f"WARNING: NaN/Inf in targets[{name}] - zeroing out")
-                targets[name] = torch.zeros_like(tensor)
+        # Input validation and sanitization
+        predictions = self._sanitize_predictions(predictions)
+        targets = self._sanitize_targets(targets)
                 
         device = self._get_device_from_inputs(predictions, targets)
         losses = {}
-        total_loss = torch.tensor(0.0, device=device)
+        total_loss = torch.tensor(0.0, device=device, requires_grad=True)
 
-        # ---- 1) Core losses (always computed - lightweight) ----
+        # ---- STAGE 1 LOSSES (Always computed - lightweight) ----
         if "segmentation" in predictions and "mask" in targets:
             seg_pred = predictions["segmentation"]
             seg_target = targets["mask"].long()
 
             ce_loss = self.ce_loss(seg_pred, seg_target)
-            losses["ce"] = ce_loss
-            losses["seg"] = ce_loss  # alias for dynamic weighting
+            losses["seg"] = ce_loss  # Use 'seg' for consistency with weighter
 
             dice_loss = self._dice_loss(seg_pred, seg_target)
             losses["dice"] = dice_loss
 
         if "sdf" in predictions and "mask" in targets:
             sdf_pred = predictions["sdf"]
-            sdf_pred = torch.clamp(sdf_pred, -1.0, 1.0)   # FIX: prevent huge values
+            sdf_pred = torch.clamp(sdf_pred, -1.0, 1.0)
             sdf_target = self._mask_to_sdf(targets["mask"])
             sdf_target = sdf_target.to(sdf_pred.device).type_as(sdf_pred)
             losses["sdf"] = self.mse_loss(sdf_pred, sdf_target)
@@ -321,27 +385,30 @@ class ResearchGradeLoss(nn.Module):
             tgt_attr = targets["attributes"].float().to(pred_attr.device)
             losses["attr"] = self.l1_loss(pred_attr, tgt_attr)
 
-        # ---- 2) Conditional geometric losses (heavy operations) ----
+        # Traditional topology and graph losses (stage-independent)
+        if "segmentation" in predictions:
+            losses["topology"] = self._topology_loss(predictions["segmentation"])
+            losses["graph"] = self._graph_topology_loss(predictions["segmentation"])
+
+        # ---- STAGE 2+ GEOMETRIC LOSSES (Conditional on run_full_geometric) ----
         if run_full_geometric:
-            # Polygon loss (only if model produced polygons)
+            # Polygon loss (Stage 2+)
             if ("polygons" in predictions and predictions["polygons"] is not None and
                 "polygons_gt" in targets):
                 losses["polygon"] = self._polygon_loss(predictions, targets["polygons_gt"])
             else:
-                # Zero loss if polygons not available
                 losses["polygon"] = torch.tensor(0.0, device=device)
 
-            # Voxel loss (only if model produced voxels)
+            # Voxel loss (Stage 3)
             if ("voxels_pred" in predictions and predictions["voxels_pred"] is not None and
                 "voxels_gt" in targets):
                 pred_vox = predictions["voxels_pred"].float()
                 tgt_vox = targets["voxels_gt"].float().to(pred_vox.device)
                 losses["voxel"] = self._voxel_iou_loss(pred_vox, tgt_vox)
             else:
-                # Zero loss if voxels not available
                 losses["voxel"] = torch.tensor(0.0, device=device)
 
-            # Cross-modal latent consistency (only if embeddings available)
+            # Cross-modal latent consistency (Stage 3)
             if ("latent_2d_embedding" in predictions and "latent_3d_embedding" in predictions and
                 predictions["latent_2d_embedding"] is not None and predictions["latent_3d_embedding"] is not None):
                 consistency_loss = self._latent_consistency_loss(
@@ -352,68 +419,83 @@ class ResearchGradeLoss(nn.Module):
             else:
                 losses["latent_consistency"] = torch.tensor(0.0, device=device)
         else:
-            # When geometric computation is skipped, use zero losses
+            # Zero losses when geometric computation is skipped
             losses["polygon"] = torch.tensor(0.0, device=device)
             losses["voxel"] = torch.tensor(0.0, device=device)
             losses["latent_consistency"] = torch.tensor(0.0, device=device)
 
-        # ---- 3) Independent auxiliary losses (always computed if enabled) ----
-        # Traditional topology loss
-        if "segmentation" in predictions:
-            losses["topology"] = self._topology_loss(predictions["segmentation"])
+        # ---- APPLY WEIGHTING (Stage-aware dynamic or static) ----
+        # Filter out zero/non-differentiable losses for weighting
+        active_losses = {
+            name: loss for name, loss in losses.items()
+            if isinstance(loss, torch.Tensor) and loss.requires_grad and loss.item() > 1e-8
+        }
 
-        # Graph-based topology constraints
-        if "segmentation" in predictions:
-            graph_loss = self._graph_topology_loss(predictions["segmentation"])
-            losses["graph"] = graph_loss
-
-        # ---- 4) Apply weighting ----
-        if self.enable_dynamic_weighting and shared_parameters is not None:
-            # Only include differentiable losses for GradNorm
-            task_losses = {
-                name: loss for name, loss in losses.items()
-                if name in self.weights and isinstance(loss, torch.Tensor) and loss.requires_grad
-            }
-
-            dynamic_weights = self.loss_weighter.update_weights(task_losses, shared_parameters)
-
-            # Apply weights (dynamic for diff losses, static for non-diff losses)
-            for name, loss in losses.items():
-                if name in self.weights:
-                    if name in dynamic_weights:
-                        weight = dynamic_weights[name]
-                    else:
-                        weight = self.weights[name]
-                    total_loss = total_loss + weight * loss
+        if self.enable_dynamic_weighting and shared_parameters is not None and active_losses:
+            # Dynamic weighting with stage-aware initialization
+            try:
+                dynamic_weights = self.loss_weighter.update_weights(
+                    active_losses, shared_parameters, self.update_freq
+                )
+                
+                # Apply dynamic weights where available, static elsewhere
+                for name, loss in losses.items():
+                    if name in self.weights:
+                        weight = dynamic_weights.get(name, self.weights[name])
+                        if isinstance(loss, torch.Tensor) and torch.isfinite(loss):
+                            total_loss = total_loss + weight * loss
+                            
+            except Exception as e:
+                print(f"[ResearchGradeLoss] Dynamic weighting failed: {e}, falling back to static weights")
+                # Fallback to static weights
+                for name, loss in losses.items():
+                    if name in self.weights and isinstance(loss, torch.Tensor) and torch.isfinite(loss):
+                        total_loss = total_loss + self.weights[name] * loss
         else:
             # Static weights
             for name, loss in losses.items():
-                if name in self.weights:
+                if name in self.weights and isinstance(loss, torch.Tensor) and torch.isfinite(loss):
                     total_loss = total_loss + self.weights[name] * loss
 
-        # Final NaN/Inf guard
-        for k, v in list(losses.items()):
-            if torch.isnan(v).any() or torch.isinf(v).any():
-                print(f"[Warning] {k} loss is NaN/Inf → zeroed out")
-                losses[k] = torch.tensor(0.0, device=device)
+        # Final sanitization
+        if not torch.isfinite(total_loss):
+            print("[ResearchGradeLoss] Warning: Non-finite total loss detected, using fallback")
+            total_loss = torch.tensor(1.0, device=device, requires_grad=True)
 
         losses["total"] = total_loss
         return total_loss, losses
 
     def __call__(self, predictions: dict, targets: dict, shared_parameters=None, run_full_geometric=True):
-        """
-        Convenience method for trainer compatibility
-        
-        Args:
-            predictions: Model predictions dict  
-            targets: Ground truth targets dict
-            shared_parameters: Model parameters for GradNorm (optional)
-            run_full_geometric: Whether to compute geometric losses
-        
-        Returns:
-            tuple: (total_loss, individual_losses_dict)
-        """
+        """Trainer compatibility method"""
         return self.forward(predictions, targets, shared_parameters, run_full_geometric)
+
+    def _sanitize_predictions(self, predictions: dict) -> dict:
+        """Sanitize prediction tensors"""
+        sanitized = {}
+        for name, tensor in predictions.items():
+            if torch.is_tensor(tensor):
+                if torch.isnan(tensor).any() or torch.isinf(tensor).any():
+                    print(f"WARNING: NaN/Inf in predictions[{name}] - zeroing out")
+                    sanitized[name] = torch.zeros_like(tensor)
+                else:
+                    sanitized[name] = tensor
+            else:
+                sanitized[name] = tensor
+        return sanitized
+
+    def _sanitize_targets(self, targets: dict) -> dict:
+        """Sanitize target tensors"""
+        sanitized = {}
+        for name, tensor in targets.items():
+            if torch.is_tensor(tensor):
+                if torch.isnan(tensor).any() or torch.isinf(tensor).any():
+                    print(f"WARNING: NaN/Inf in targets[{name}] - zeroing out")
+                    sanitized[name] = torch.zeros_like(tensor)
+                else:
+                    sanitized[name] = tensor
+            else:
+                sanitized[name] = tensor
+        return sanitized
 
     def _get_device_from_inputs(self, predictions, targets):
         """Helper to determine device from inputs"""
@@ -423,36 +505,24 @@ class ResearchGradeLoss(nn.Module):
                     return value.device
         return self.device
 
-    # ---- NEW: Cross-modal latent consistency loss ----
+    # ---- LOSS COMPONENT IMPLEMENTATIONS ----
+    
     def _latent_consistency_loss(self, embedding_2d: torch.Tensor, embedding_3d: torch.Tensor) -> torch.Tensor:
-        """
-        Ensure 2D floorplan embeddings match 3D voxelized structure embeddings
-        embedding_2d: [B, D] - 2D floorplan embeddings
-        embedding_3d: [B, D] - 3D structure embeddings
-        """
+        """Cross-modal latent consistency loss"""
         if embedding_2d.shape != embedding_3d.shape:
-            # Project to same dimension if needed
             min_dim = min(embedding_2d.shape[-1], embedding_3d.shape[-1])
             embedding_2d = embedding_2d[..., :min_dim]
             embedding_3d = embedding_3d[..., :min_dim]
         
-        # Cosine similarity loss (maximize similarity)
         target = torch.ones(embedding_2d.shape[0], device=embedding_2d.device)
         cosine_loss = self.cosine_loss(embedding_2d, embedding_3d, target)
-        
-        # L2 consistency loss
         l2_loss = F.mse_loss(embedding_2d, embedding_3d)
         
         return 0.7 * cosine_loss + 0.3 * l2_loss
 
-    # ---- NEW: Graph-based topology constraints ----
     def _graph_topology_loss(self, segmentation_logits: torch.Tensor) -> torch.Tensor:
-        """
-        Graph-based topology constraints on room connectivity
-        segmentation_logits: [B, C, H, W]
-        """
+        """Graph-based topology constraints"""
         try:
-            # Extract graph structure
             graph_data = GraphTopologyExtractor.extract_room_graph(segmentation_logits)
             device = segmentation_logits.device
             
@@ -465,23 +535,16 @@ class ResearchGradeLoss(nn.Module):
                     if adj_matrix.numel() == 0:
                         continue
                         
-                    # Connectivity constraint: encourage reasonable connectivity
-                    # Penalize isolated rooms (degree 0) and over-connected rooms
                     degrees = adj_matrix.sum(dim=1)
-                    
-                    # Isolation penalty (rooms should have at least 1 connection)
                     isolation_penalty = torch.exp(-degrees).mean()
                     
-                    # Over-connection penalty (rooms shouldn't connect to everything)
                     max_reasonable_connections = min(4, adj_matrix.shape[0] - 1)
                     over_connection_penalty = F.relu(degrees - max_reasonable_connections).mean()
                     
-                    # Graph smoothness (connected rooms should have similar features)
                     if b < len(graph_data["room_features"]) and graph_data["room_features"][b].numel() > 0:
                         room_features = graph_data["room_features"][b]
                         if room_features.shape[0] > 1:
                             feature_distances = torch.cdist(room_features, room_features)
-                            # Weight by adjacency - connected rooms should be similar
                             smoothness_loss = (adj_matrix * feature_distances).sum() / (adj_matrix.sum() + 1e-6)
                         else:
                             smoothness_loss = torch.tensor(0.0, device=device)
@@ -496,15 +559,12 @@ class ResearchGradeLoss(nn.Module):
             return total_graph_loss / batch_size
             
         except Exception as e:
-            # Fallback to zero loss if graph extraction fails
             return torch.tensor(0.0, device=segmentation_logits.device)
 
-    # ---- Existing helper methods (preserved) ----
     def _dice_loss(self, pred: torch.Tensor, target: torch.Tensor, smooth: float = 1e-6) -> torch.Tensor:
         """Dice loss implementation"""
         pred_soft = F.softmax(pred, dim=1)
-        B = pred_soft.shape[0]
-        C = pred_soft.shape[1]
+        B, C = pred_soft.shape[:2]
 
         dice_losses = []
         for c in range(C):
@@ -518,20 +578,16 @@ class ResearchGradeLoss(nn.Module):
         return torch.stack(dice_losses).mean()
 
     def _mask_to_sdf(self, mask: torch.Tensor) -> torch.Tensor:
-        """Convert mask to SDF with performance warning"""
-        device = mask.device if torch.is_tensor(mask) else None
+        """Convert mask to SDF"""
+        device = mask.device if torch.is_tensor(mask) else self.device
         if not torch.is_tensor(mask):
             mask = torch.tensor(mask, device=device)
 
         B, H, W = mask.shape
         sdf = torch.zeros((B, 1, H, W), dtype=torch.float32, device=device)
 
-        # FIX: Add performance warning for CV2 bottleneck
-        if B > 8:  # Warn for large batches
-            print(f"[Performance Warning] SDF conversion with batch_size={B} uses CPU cv2 - consider GPU implementation")
-
         for b in range(B):
-            mask_np = mask[b].detach().cpu().numpy().astype(np.uint8)  # FIX: explicit detach
+            mask_np = mask[b].detach().cpu().numpy().astype(np.uint8)
             try:
                 dist_inside = cv2.distanceTransform((mask_np > 0).astype(np.uint8), cv2.DIST_L2, 5)
                 dist_outside = cv2.distanceTransform((mask_np == 0).astype(np.uint8), cv2.DIST_L2, 5)
@@ -539,13 +595,12 @@ class ResearchGradeLoss(nn.Module):
                 sdf_np = np.tanh(sdf_np / 10.0).astype(np.float32)
                 sdf[b, 0] = torch.from_numpy(sdf_np)
             except Exception:
-                # Fallback if cv2 fails
                 sdf[b, 0] = torch.zeros_like(mask[b].float())
 
         return sdf
 
     def _polygon_loss(self, predictions: dict, targets: dict) -> torch.Tensor:
-        """Polygon/DVX loss (preserved from original)"""
+        """Polygon/DVX loss"""
         pred_polys = predictions.get("polygons")
         tgt_polys = targets.get("polygons")
         valid_mask = targets.get("valid_mask")
@@ -572,7 +627,7 @@ class ResearchGradeLoss(nn.Module):
         return point_loss + 0.1 * validity_loss + 0.05 * smoothness_loss + 0.1 * rect_loss
 
     def _polygon_smoothness(self, polygons: torch.Tensor) -> torch.Tensor:
-        """Polygon smoothness loss (preserved)"""
+        """Polygon smoothness loss"""
         if polygons is None or polygons.numel() == 0:
             return torch.tensor(0.0, device=polygons.device if polygons is not None else self.device)
 
@@ -583,7 +638,7 @@ class ResearchGradeLoss(nn.Module):
         return curvature.mean()
 
     def _rectilinearity_loss(self, polygons: torch.Tensor) -> torch.Tensor:
-        """Encourage axis-aligned structure (preserved)"""
+        """Encourage axis-aligned structure"""
         if polygons is None or polygons.numel() == 0:
             return torch.tensor(0.0, device=polygons.device if polygons is not None else self.device)
 
@@ -602,8 +657,8 @@ class ResearchGradeLoss(nn.Module):
         return angle_penalty.mean()
 
     def _voxel_iou_loss(self, pred_voxels: torch.Tensor, target_voxels: torch.Tensor) -> torch.Tensor:
-        """3D voxel IoU loss (preserved)"""
-        pred_prob = torch.sigmoid(torch.clamp(pred_voxels, -10.0, 10.0))  # FIX: safe sigmoid range
+        """3D voxel IoU loss"""
+        pred_prob = torch.sigmoid(torch.clamp(pred_voxels, -10.0, 10.0))
         target = target_voxels.float().to(pred_prob.device)
 
         intersection = (pred_prob * target).view(pred_prob.shape[0], -1).sum(dim=1)
@@ -614,7 +669,7 @@ class ResearchGradeLoss(nn.Module):
         return (1.0 - iou).mean()
 
     def _topology_loss(self, segmentation_logits: torch.Tensor) -> torch.Tensor:
-        """Traditional topology loss (preserved)"""
+        """Traditional topology loss"""
         seg_soft = F.softmax(segmentation_logits, dim=1)
         C = seg_soft.shape[1]
         device = seg_soft.device
@@ -634,7 +689,7 @@ class ResearchGradeLoss(nn.Module):
         return door_penalty.mean() + window_penalty.mean() + 0.1 * connectivity_loss
 
     def _connectivity_loss(self, wall_prob: torch.Tensor) -> torch.Tensor:
-        """Connectivity loss for walls (preserved)"""
+        """Connectivity loss for walls"""
         if wall_prob is None or wall_prob.numel() == 0:
             return torch.tensor(0.0, device=wall_prob.device if wall_prob is not None else self.device)
 
@@ -655,16 +710,7 @@ class LossScheduler:
     def get_scheduled_weights(self, current_stage: int, current_epoch: int, 
                             stage_epoch: int, total_stage_epochs: int,
                             base_weights: Dict[str, float]) -> Dict[str, float]:
-        """
-        Calculate loss weights based on curriculum schedule
-        
-        Args:
-            current_stage: Current training stage (1, 2, 3)
-            current_epoch: Global epoch count
-            stage_epoch: Epoch within current stage
-            total_stage_epochs: Total epochs planned for current stage
-            base_weights: Base weight configuration
-        """
+        """Calculate loss weights based on curriculum schedule"""
         scheduled_weights = base_weights.copy()
         
         for loss_name, schedule_type in self.loss_schedules.items():
@@ -674,11 +720,9 @@ class LossScheduler:
             base_weight = scheduled_weights[loss_name]
             
             if schedule_type == "static":
-                # Keep original weight
                 continue
                 
             elif schedule_type == "progressive":
-                # Gradually increase throughout training
                 if loss_name == "topology":
                     start_weight = self.config.topology_start_weight
                     end_weight = self.config.topology_end_weight
@@ -687,22 +731,18 @@ class LossScheduler:
                     scheduled_weights[loss_name] = start_weight + progress * (end_weight - start_weight)
                     
             elif schedule_type == "linear_ramp":
-                # Linear increase within current stage
                 progress = stage_epoch / max(total_stage_epochs, 1)
                 scheduled_weights[loss_name] = base_weight * progress
                 
             elif schedule_type == "exponential":
-                # Exponential increase
                 progress = stage_epoch / max(total_stage_epochs, 1)
                 scheduled_weights[loss_name] = base_weight * (progress ** 2)
                 
             elif schedule_type == "early_decay":
-                # Decay after Stage 1 (for SDF loss)
                 if current_stage > 1:
                     scheduled_weights[loss_name] = base_weight * 0.3
                     
             elif schedule_type == "staged_ramp":
-                # Ramp up during specific stage (polygon in Stage 2)
                 if current_stage == 2:
                     progress = stage_epoch / max(total_stage_epochs, 1)
                     scheduled_weights[loss_name] = base_weight * progress
@@ -710,7 +750,6 @@ class LossScheduler:
                     scheduled_weights[loss_name] = 0.0
                     
             elif schedule_type == "late_ramp":
-                # Ramp up in Stage 3 (voxel loss)
                 if current_stage == 3:
                     progress = stage_epoch / max(total_stage_epochs, 1)
                     scheduled_weights[loss_name] = base_weight * progress
@@ -718,21 +757,19 @@ class LossScheduler:
                     scheduled_weights[loss_name] = 0.0
                     
             elif schedule_type == "mid_ramp":
-                # Activate mid-training (latent consistency)
                 if current_stage >= 2:
                     if current_stage == 2:
                         progress = min(stage_epoch / (total_stage_epochs * 0.5), 1.0)
                         scheduled_weights[loss_name] = base_weight * progress
-                    else:  # Stage 3
+                    else:
                         scheduled_weights[loss_name] = base_weight
                 else:
                     scheduled_weights[loss_name] = 0.0
                     
             elif schedule_type == "delayed_ramp":
-                # FIX: gentler ramp for graph constraints
                 if current_epoch >= self.config.graph_start_epoch:
                     epochs_since_start = current_epoch - self.config.graph_start_epoch
-                    ramp_duration = 50  # FIX: slower ramp (was 20)
+                    ramp_duration = 50
                     progress = min(epochs_since_start / ramp_duration, 1.0)
                     scheduled_weights[loss_name] = self.config.graph_end_weight * progress
                 else:
