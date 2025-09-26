@@ -84,7 +84,7 @@ class CurriculumConfig:
     # Graph constraint scheduling
     graph_weight_schedule: str = "delayed_ramp"
     graph_start_epoch: int = 15
-    graph_end_weight: float = 0.5
+    graph_end_weight: float = 0.25
     
     def __post_init__(self):
         # Provide default loss schedule if not set
@@ -132,20 +132,20 @@ class TrainingConfig:
     min_stage3_epochs: int = 12
     
     # Learning rates (per stage)
-    stage1_lr: float = 1e-5  # was 3e-4
+    stage1_lr: float = 3e-4  # was 3e-4
     stage1_weight_decay: float = 1e-5
     
-    stage2_lr: float = 5e-6  # was 1e-4 
+    stage2_lr: float = 1e-4  # was 1e-4 
     stage2_weight_decay: float = 1e-5
     
-    stage3_lr: float = 1e-6  # was 5e-5
+    stage3_lr: float = 5e-5  # was 5e-5
     stage3_weight_decay: float = 1e-5
     
     # Advanced training techniques
     use_mixed_precision: bool = True
     use_cosine_restarts: bool = True
     warmup_epochs: int = 5
-    grad_clip_norm: float = 0.5
+    grad_clip_norm: float = 1.0
     
     # Gradient monitoring for dynamic weighting
     track_gradient_norms: bool = True

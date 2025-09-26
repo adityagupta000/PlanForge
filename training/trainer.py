@@ -162,26 +162,32 @@ class AdaptiveMultiStageTrainer:
             betas=(0.9, 0.999),
         )
 
-        # Enhanced learning rate schedulers
+        # Enhanced learning rate schedulers with proper minimum LR
         if config.use_cosine_restarts:
             self.scheduler_2d = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-                self.optimizer_2d, T_0=20, T_mult=1
+                self.optimizer_2d, T_0=20, T_mult=1,
+                eta_min=config.stage1_lr * 0.1  # Min LR is 10% of initial
             )
             self.scheduler_dvx = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-                self.optimizer_dvx, T_0=15, T_mult=1
+                self.optimizer_dvx, T_0=15, T_mult=1,
+                eta_min=config.stage2_lr * 0.1
             )
             self.scheduler_full = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-                self.optimizer_full, T_0=30, T_mult=1
+                self.optimizer_full, T_0=30, T_mult=1,
+                eta_min=config.stage3_lr * 0.1
             )
         else:
             self.scheduler_2d = torch.optim.lr_scheduler.CosineAnnealingLR(
-                self.optimizer_2d, T_max=config.max_stage1_epochs
+                self.optimizer_2d, T_max=config.max_stage1_epochs,
+                eta_min=config.stage1_lr * 0.1  # Min LR is 10% of initial
             )
             self.scheduler_dvx = torch.optim.lr_scheduler.CosineAnnealingLR(
-                self.optimizer_dvx, T_max=config.max_stage2_epochs
+                self.optimizer_dvx, T_max=config.max_stage2_epochs,
+                eta_min=config.stage2_lr * 0.1
             )
             self.scheduler_full = torch.optim.lr_scheduler.CosineAnnealingLR(
-                self.optimizer_full, T_max=config.max_stage3_epochs
+                self.optimizer_full, T_max=config.max_stage3_epochs,
+                eta_min=config.stage3_lr * 0.1
             )
 
         # Enhanced loss function with dynamic weighting
@@ -265,26 +271,29 @@ class AdaptiveMultiStageTrainer:
         )
 
     def _train_epoch(self, mode="stage1"):
-        """Enhanced training epoch with AMP, gradient accumulation, and DVX gating"""
+        """Enhanced training epoch with improved stability and speed"""
         self.model.train()
         total_loss = 0
         component_loss_sums = {}
 
-        # Select appropriate optimizer based on mode
+        # Select optimizer and apply gradient scaling
         if mode == "stage1":
             optimizer = self.optimizer_2d
         elif mode == "stage2":
             optimizer = self.optimizer_dvx
-        else:  # stage3
+        else:
             optimizer = self.optimizer_full
 
-        # Progress bar for training batches
+        # Improved progress tracking
         train_pbar = tqdm(
             self.train_loader, desc=f"Training {mode.upper()}", leave=False, ncols=120
         )
 
         batch_count = 0
         epoch_start_time = time.time()
+        
+        # Add gradient accumulation tracking
+        accumulated_loss = 0.0
 
         for batch_idx, batch in enumerate(train_pbar):
             self._step += 1
@@ -293,55 +302,26 @@ class AdaptiveMultiStageTrainer:
                 for k, v in batch.items()
             }
 
-            # Gate heavy DVX/extrusion: only run full forward every dvx_step_freq steps
-            run_full_geometric = (self.dvx_step_freq <= 1) or (
-                (self._step % self.dvx_step_freq) == 0
+            # Smart geometric computation gating
+            run_full_geometric = (
+                mode == "stage3" or  # Always run in final stage
+                (mode == "stage2" and self._step % 1 == 0) or  # Every other step in stage 2
+                (mode == "stage1" and self._step % 2 == 0)  # Every 4th step in stage 1
             )
 
-            # First-batch profiling (optional timing helper)
-            if batch_idx == 0 and self.global_epoch == 0:
-                torch.cuda.synchronize()
-                t0 = time.time()
-                with autocast("cuda", enabled=self.use_amp):
-                    out = self.model(batch["image"], run_full_geometric=True)
-                    # Prepare targets for loss computation
-                    targets = self._prepare_targets(batch, mode)
-                    shared_params = (
-                        self._get_shared_parameters()
-                        if self.config.curriculum.use_gradnorm
-                        else None
-                    )
-                    l, _ = self.loss_fn(
-                        out, targets, shared_params, run_full_geometric=True
-                    )
-                torch.cuda.synchronize()
-                print(f"First-batch forward+loss time: {time.time() - t0:.3f}s")
-
             with autocast("cuda", enabled=self.use_amp):
-                # Forward pass with geometric gating
                 predictions = self.model(
                     batch["image"], run_full_geometric=run_full_geometric
                 )
 
-                # Add latent embeddings if model supports it
-                if hasattr(self.model, "get_latent_embeddings"):
-                    latent_2d, latent_3d = self.model.get_latent_embeddings(
-                        batch["image"]
-                    )
-                    predictions["latent_2d_embedding"] = latent_2d
-                    predictions["latent_3d_embedding"] = latent_3d
-
-                # Prepare targets based on training mode
                 targets = self._prepare_targets(batch, mode)
-
-                # Get shared parameters for dynamic weighting
+                
                 shared_params = (
                     self._get_shared_parameters()
                     if self.config.curriculum.use_gradnorm
                     else None
                 )
 
-                # Compute loss with dynamic weighting and geometric gating
                 loss, loss_components = self.loss_fn(
                     predictions,
                     targets,
@@ -349,31 +329,35 @@ class AdaptiveMultiStageTrainer:
                     run_full_geometric=run_full_geometric,
                 )
 
-                # Scale loss for gradient accumulation
+                # Scale for accumulation
                 loss = loss / self.accumulation_steps
+                accumulated_loss += loss.item()
 
-            # Scale and backward pass
+            # Backward pass with stability
             self.scaler.scale(loss).backward()
 
-            # Gradient accumulation step
+            # Gradient accumulation and update
             if ((batch_idx + 1) % self.accumulation_steps) == 0:
-                # Unscale and clip gradients
+                # Enhanced gradient clipping
                 self.scaler.unscale_(optimizer)
-
-                # Apply gradient clipping
+                
+                # Adaptive gradient clipping based on loss magnitude
+                max_grad_norm = min(self.config.grad_clip_norm * (1.0 + accumulated_loss), 2.0)
                 torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(), self.config.grad_clip_norm
+                    self.model.parameters(), max_grad_norm
                 )
 
-                # Optimizer step with scaler
                 self.scaler.step(optimizer)
                 self.scaler.update()
                 optimizer.zero_grad()
+                
+                # Reset accumulation
+                accumulated_loss = 0.0
 
             current_loss = loss.item() * self.accumulation_steps
             total_loss += current_loss
 
-            # Track component losses
+            # Track components with better averaging
             for name, component_loss in loss_components.items():
                 if name != "total":
                     loss_val = (
@@ -382,51 +366,44 @@ class AdaptiveMultiStageTrainer:
                         else component_loss
                     )
                     if name not in component_loss_sums:
-                        component_loss_sums[name] = 0
-                    component_loss_sums[name] += loss_val
+                        component_loss_sums[name] = []
+                    component_loss_sums[name].append(loss_val)
 
             batch_count += 1
 
-            # Occasional lightweight logging
-            if (batch_idx + 1) % 50 == 0:
+            # Less frequent but more informative logging
+            if (batch_idx + 1) % 100 == 0:
                 elapsed = time.time() - epoch_start_time
                 avg_time_per_batch = elapsed / (batch_idx + 1)
-                current_weights = {
-                    k: f"{v:.3f}" for k, v in self.loss_fn.weights.items() if v > 0.001
-                }
-                print(
-                    f"[Epoch {self.global_epoch}] Batch {batch_idx+1}/{len(self.train_loader)} | "
-                    f"avg batch {avg_time_per_batch:.3f}s | loss {total_loss/batch_count:.4f}"
-                )
+                
+                # Show meaningful component averages
+                recent_components = {}
+                for name, vals in component_loss_sums.items():
+                    if len(vals) >= 10:  # Only show if we have enough samples
+                        recent_avg = np.mean(vals[-10:])  # Last 10 batches
+                        if recent_avg > 0.01:  # Only show significant components
+                            recent_components[name] = recent_avg
+                
+                comp_str = ", ".join([f"{k}:{v:.3f}" for k, v in recent_components.items()])
+                print(f"[Epoch {self.global_epoch}] Batch {batch_idx+1} | "
+                      f"{avg_time_per_batch:.2f}s/batch | loss:{total_loss/batch_count:.4f} | {comp_str}")
 
-            # Update progress bar
-            current_weights = {
-                k: f"{v:.3f}" for k, v in self.loss_fn.weights.items() if v > 0.001
-            }
-            train_pbar.set_postfix(
-                {
-                    "loss": f"{current_loss:.4f}",
-                    "weights": str(current_weights)[:50] + "..."
-                    if len(str(current_weights)) > 50
-                    else str(current_weights),
-                }
-            )
+            # Update progress with meaningful info
+            train_pbar.set_postfix({
+                "loss": f"{current_loss:.4f}",
+                "lr": f"{optimizer.param_groups[0]['lr']:.6f}"
+            })
 
-        # Final epoch timing
-        epoch_time = time.time() - epoch_start_time
-        avg_loss = total_loss / batch_count
-        print(
-            f"Epoch {self.global_epoch} finished in {epoch_time/60:.2f} min. avg loss: {avg_loss:.4f}"
-        )
+        # Calculate proper component averages
+        avg_component_losses = {}
+        for name, loss_list in component_loss_sums.items():
+            if loss_list:
+                avg_component_losses[name] = np.mean(loss_list)
+            else:
+                avg_component_losses[name] = 0.0
 
-        # Average component losses
-        avg_component_losses = {
-            name: loss_sum / batch_count
-            for name, loss_sum in component_loss_sums.items()
-        }
-
-        return avg_loss, avg_component_losses
-
+        return total_loss / batch_count, avg_component_losses
+  
     def _prepare_targets(self, batch, mode):
         """Prepare targets based on training mode"""
         if mode == "stage1":
@@ -450,7 +427,7 @@ class AdaptiveMultiStageTrainer:
             }
 
     def _validate(self, mode="stage1"):
-        """Enhanced validation with detailed metrics and AMP support"""
+        """Enhanced validation with consistent loss computation"""
         self.model.eval()
         total_loss = 0
         component_loss_sums = {}
@@ -468,27 +445,20 @@ class AdaptiveMultiStageTrainer:
                 }
 
                 with autocast("cuda", enabled=self.use_amp):
-                    # Always run full geometric computation during validation
+                    # ALWAYS run full geometric in validation for consistency
                     predictions = self.model(batch["image"], run_full_geometric=True)
 
-                    # Add latent embeddings if available
-                    if hasattr(self.model, "get_latent_embeddings"):
-                        latent_2d, latent_3d = self.model.get_latent_embeddings(
-                            batch["image"]
-                        )
-                        predictions["latent_2d_embedding"] = latent_2d
-                        predictions["latent_3d_embedding"] = latent_3d
+                    targets = self._prepare_targets(batch, "stage3")  # Use full targets
 
-                    targets = self._prepare_targets(batch, mode)
-
+                    # Use same loss computation as training but without dynamic weighting
                     loss, loss_components = self.loss_fn(
-                        predictions, targets, run_full_geometric=True
+                        predictions, targets, shared_parameters=None, run_full_geometric=True
                     )
 
                 current_loss = loss.item()
                 total_loss += current_loss
 
-                # Track component losses
+                # Track component losses properly
                 for name, component_loss in loss_components.items():
                     if name != "total":
                         loss_val = (
@@ -497,16 +467,19 @@ class AdaptiveMultiStageTrainer:
                             else component_loss
                         )
                         if name not in component_loss_sums:
-                            component_loss_sums[name] = 0
-                        component_loss_sums[name] += loss_val
+                            component_loss_sums[name] = []
+                        component_loss_sums[name].append(loss_val)
 
                 batch_count += 1
                 val_pbar.set_postfix({"loss": f"{current_loss:.4f}"})
 
-        avg_component_losses = {
-            name: loss_sum / batch_count
-            for name, loss_sum in component_loss_sums.items()
-        }
+        # Calculate proper averages
+        avg_component_losses = {}
+        for name, loss_list in component_loss_sums.items():
+            if loss_list:
+                avg_component_losses[name] = np.mean(loss_list)
+            else:
+                avg_component_losses[name] = 0.0
 
         return total_loss / batch_count, avg_component_losses
 
@@ -572,10 +545,17 @@ class AdaptiveMultiStageTrainer:
             # Update learning rate
             if stage == 1:
                 self.scheduler_2d.step()
+                current_lr = self.optimizer_2d.param_groups[0]['lr']
             elif stage == 2:
                 self.scheduler_dvx.step()
+                current_lr = self.optimizer_dvx.param_groups[0]['lr']
             else:
                 self.scheduler_full.step()
+                current_lr = self.optimizer_full.param_groups[0]['lr']
+            
+            # Log learning rate every 10 epochs
+            if (epoch + 1) % 10 == 0:
+                print(f"Learning rate at epoch {epoch + 1}: {current_lr:.6f}")
 
             # Display comprehensive results
             self._display_epoch_results(

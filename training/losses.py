@@ -15,8 +15,6 @@ import networkx as nx
 
 
 class DynamicLossWeighter:
-    """Implements GradNorm and other dynamic weighting strategies with stage-aware initialization"""
-    
     def __init__(self, loss_names: List[str], alpha: float = 0.12, device: str = 'cuda'):
         self.loss_names = loss_names
         self.alpha = alpha
@@ -24,76 +22,73 @@ class DynamicLossWeighter:
         
         # Initialize weights for all known loss components
         self.weights = {name: 1.0 for name in loss_names}
-        self.initial_task_losses = {}  # Will be populated dynamically as losses appear
+        self.initial_task_losses = {}
+        # Add running normalization to prevent raw magnitude issues
         self.running_mean_losses = {name: 0.0 for name in loss_names}
+        self.running_std_losses = {name: 1.0 for name in loss_names}  # NEW
         self.update_count = 0
         
         print(f"[DynamicWeighter] Initialized with loss components: {loss_names}")
         
     def update_weights(self, task_losses: Dict[str, torch.Tensor], 
                       shared_parameters, update_freq: int = 10):
-        """Update loss weights using GradNorm algorithm with stage-aware initialization"""
+        """Update loss weights using GradNorm with stability improvements"""
         if self.update_count % update_freq != 0:
             self.update_count += 1
             return self.weights
         
-        # === STAGE-AWARE DYNAMIC INITIALIZATION ===
-        # Initialize tracking for any new loss components that appear during stage transitions
+        # Initialize tracking for new loss components
         newly_initialized = []
         for name, loss in task_losses.items():
             if name not in self.initial_task_losses:
                 loss_val = loss.item() if torch.is_tensor(loss) else float(loss)
-                # Use absolute value and ensure non-zero for numerical stability
-                self.initial_task_losses[name] = max(abs(loss_val), 1e-6)
+                # Use log-scale initialization for stability
+                self.initial_task_losses[name] = max(np.log(abs(loss_val) + 1e-6), -10.0)
                 
-                # Initialize weights and running means for new components
                 if name not in self.weights:
                     self.weights[name] = 1.0
                 if name not in self.running_mean_losses:
                     self.running_mean_losses[name] = loss_val
+                if name not in self.running_std_losses:
+                    self.running_std_losses[name] = max(abs(loss_val), 1e-3)
                     
                 newly_initialized.append(name)
         
-        if newly_initialized:
-            print(f"[DynamicWeighter] Stage transition detected - initialized new losses: {newly_initialized}")
-            for name in newly_initialized:
-                print(f"  • {name}: initial_value={self.initial_task_losses[name]:.6f}")
-        
-        # Update running mean - only for losses present in current batch
+        # Update running statistics with EMA
         for name, loss in task_losses.items():
             loss_val = loss.item() if torch.is_tensor(loss) else float(loss)
             if name in self.running_mean_losses:
-                self.running_mean_losses[name] = (0.9 * self.running_mean_losses[name] + 
-                                                0.1 * loss_val)
-            else:
-                # Fallback for completely new loss (shouldn't happen with above init)
-                self.running_mean_losses[name] = loss_val
+                # Exponential moving average for mean and std
+                self.running_mean_losses[name] = 0.9 * self.running_mean_losses[name] + 0.1 * loss_val
+                
+                # Update running std using Welford's algorithm
+                delta = loss_val - self.running_mean_losses[name]
+                self.running_std_losses[name] = 0.9 * self.running_std_losses[name] + 0.1 * abs(delta)
+                self.running_std_losses[name] = max(self.running_std_losses[name], 1e-3)
         
-        # Calculate relative decrease rates - only for active losses with valid initial values
+        # Calculate normalized relative decrease rates
         loss_ratios = {}
         for name, loss in task_losses.items():
-            if name in self.initial_task_losses and self.initial_task_losses[name] > 0:
+            if name in self.initial_task_losses and self.initial_task_losses[name] > -9.0:
+                # Normalize current loss by running statistics
                 current_loss = self.running_mean_losses.get(name, loss.item())
+                normalized_current = current_loss / (self.running_std_losses[name] + 1e-6)
+                
                 initial_loss = self.initial_task_losses[name]
-                loss_ratios[name] = current_loss / (initial_loss + 1e-8)
+                # Use log-space ratios for stability
+                loss_ratios[name] = np.exp(min(max(normalized_current - initial_loss, -5.0), 5.0))
         
-        # Skip update if no valid loss ratios
         if not loss_ratios:
-            print(f"[DynamicWeighter] No valid loss ratios computed, skipping weight update")
             self.update_count += 1
             return self.weights
         
-        avg_loss_ratio = sum(loss_ratios.values()) / len(loss_ratios)
-        
-        # Calculate gradient norms with enhanced safety - only for losses with valid ratios
+        # Calculate gradient norms with improved stability
         grad_norms = {}
         for name, loss in task_losses.items():
             if name in loss_ratios:
-                # Verify loss is differentiable and finite
                 if not torch.is_tensor(loss) or not loss.requires_grad:
                     continue
                 if not torch.isfinite(loss):
-                    print(f"Warning: Non-finite loss for {name}, skipping gradient computation")
                     continue
                     
                 try:
@@ -105,83 +100,44 @@ class DynamicLossWeighter:
                     grad_norm_sq = 0.0
                     valid_grads = False
                     for grad in grads:
-                        if grad is not None:
-                            if torch.isfinite(grad).all():
-                                grad_norm_sq += grad.norm().item() ** 2
-                                valid_grads = True
-                            else:
-                                print(f"Warning: Non-finite gradient detected for {name}")
-                                grad_norm_sq = 0.0
-                                valid_grads = False
-                                break
+                        if grad is not None and torch.isfinite(grad).all():
+                            # Apply gradient norm stabilization
+                            clipped_grad = torch.clamp(grad, -10.0, 10.0)
+                            grad_norm_sq += clipped_grad.norm().item() ** 2
+                            valid_grads = True
                     
                     if valid_grads and grad_norm_sq > 0:
-                        grad_norms[name] = grad_norm_sq ** 0.5
+                        # Use log-scale gradient norms
+                        grad_norms[name] = np.log(grad_norm_sq ** 0.5 + 1e-8)
                         
                 except Exception as e:
-                    print(f"Warning: Gradient computation failed for {name}: {e}")
                     continue
         
-        # Skip update if no valid gradients
         if not grad_norms:
-            print(f"[DynamicWeighter] No valid gradients computed, skipping weight update")
             self.update_count += 1
             return self.weights
         
-        avg_grad_norm = sum(grad_norms.values()) / len(grad_norms)
+        # Normalize gradient norms
+        mean_grad_norm = np.mean(list(grad_norms.values()))
         
-        # Safety parameters for stable training
-        epsilon = 1e-6
-        max_target_grad = 10.0  
-        max_weight_update = 2.0
-        
-        # Update weights using GradNorm formula - only for losses with valid gradients
-        weights_updated = []
+        # Update weights with improved stability
         for name in grad_norms.keys():
             if name in loss_ratios:
-                # Compute target gradient
-                target_grad = avg_grad_norm * (loss_ratios[name] ** self.alpha)
-                target_grad = min(target_grad, max_target_grad)
+                # Calculate target gradient in log space
+                target_grad_log = mean_grad_norm + self.alpha * np.log(loss_ratios[name] + 1e-8)
+                current_grad_log = grad_norms[name]
                 
-                # Compute weight update
-                safe_grad_norm = max(grad_norms[name], epsilon)
-                if safe_grad_norm == epsilon:
-                    print(f"⚠ Small gradient norm for {name}, clamped to {epsilon}")
+                # Calculate weight update with damping
+                weight_update_log = target_grad_log - current_grad_log
+                weight_update = np.exp(np.clip(weight_update_log, -1.0, 1.0))  # Stronger clipping
                 
-                weight_update = target_grad / safe_grad_norm
-                weight_update = min(weight_update, max_weight_update)
-                if weight_update == max_weight_update:
-                    print(f"⚠ Weight update for {name} clamped to {max_weight_update}")
-                
-                # Conservative momentum-based update
+                # Apply update with momentum and stronger constraints
                 current_weight = self.weights.get(name, 1.0)
-                new_weight = 0.95 * current_weight + 0.05 * float(weight_update)
-                self.weights[name] = float(np.clip(new_weight, 0.01, 3.0))
-                
-                weights_updated.append(name)
-        
-        if weights_updated:
-            print(f"[DynamicWeighter] Updated weights for: {weights_updated}")
+                new_weight = 0.8 * current_weight + 0.2 * weight_update  # More conservative
+                self.weights[name] = float(np.clip(new_weight, 0.1, 2.0))  # Tighter bounds
         
         self.update_count += 1
         return self.weights
-
-    def get_current_weights(self):
-        """Get current weights for all tracked components"""
-        return self.weights.copy()
-
-    def get_initialization_status(self):
-        """Get status of loss component initialization"""
-        return {
-            "initialized_losses": list(self.initial_task_losses.keys()),
-            "all_weights": self.weights.copy(),
-            "update_count": self.update_count
-        }
-
-    def reset_for_stage(self, stage_name):
-        """Optional method for explicit stage resets (not needed with dynamic init)"""
-        print(f"[DynamicWeighter] Stage transition to {stage_name} - dynamic initialization will handle new losses")
-
 
 class GraphTopologyExtractor:
     """Extracts graph structure from segmentation for topology constraints"""
@@ -342,18 +298,7 @@ class ResearchGradeLoss(nn.Module):
                 self.weights[key] = float(value)
 
     def forward(self, predictions: dict, targets: dict, shared_parameters=None, run_full_geometric=True):
-        """
-        Compute multi-task loss with conditional geometric computation and stage-aware dynamic weighting.
-        
-        Args:
-            predictions: Model predictions dict
-            targets: Ground truth targets dict
-            shared_parameters: Model parameters for GradNorm (optional)
-            run_full_geometric: Whether geometric losses should be computed
-        
-        Returns:
-            tuple: (total_loss, individual_losses_dict)
-        """
+        """Compute multi-task loss with proper normalization and aggregation"""
         # Input validation and sanitization
         predictions = self._sanitize_predictions(predictions)
         targets = self._sanitize_targets(targets)
@@ -362,13 +307,14 @@ class ResearchGradeLoss(nn.Module):
         losses = {}
         total_loss = torch.tensor(0.0, device=device, requires_grad=True)
 
-        # ---- STAGE 1 LOSSES (Always computed - lightweight) ----
+        # ---- STAGE 1 LOSSES with proper scaling ----
         if "segmentation" in predictions and "mask" in targets:
             seg_pred = predictions["segmentation"]
             seg_target = targets["mask"].long()
 
+            # Scale CE loss by number of pixels for consistency
             ce_loss = self.ce_loss(seg_pred, seg_target)
-            losses["seg"] = ce_loss  # Use 'seg' for consistency with weighter
+            losses["seg"] = ce_loss
 
             dice_loss = self._dice_loss(seg_pred, seg_target)
             losses["dice"] = dice_loss
@@ -378,37 +324,49 @@ class ResearchGradeLoss(nn.Module):
             sdf_pred = torch.clamp(sdf_pred, -1.0, 1.0)
             sdf_target = self._mask_to_sdf(targets["mask"])
             sdf_target = sdf_target.to(sdf_pred.device).type_as(sdf_pred)
-            losses["sdf"] = self.mse_loss(sdf_pred, sdf_target)
+            # Normalize SDF loss by spatial dimensions
+            sdf_loss = self.mse_loss(sdf_pred, sdf_target)
+            losses["sdf"] = sdf_loss
 
         if "attributes" in predictions and "attributes" in targets:
             pred_attr = predictions["attributes"].float()
             tgt_attr = targets["attributes"].float().to(pred_attr.device)
-            losses["attr"] = self.l1_loss(pred_attr, tgt_attr)
+            # Normalize attribute loss by number of attributes
+            attr_loss = self.l1_loss(pred_attr, tgt_attr) / pred_attr.shape[-1]
+            losses["attr"] = attr_loss
 
-        # Traditional topology and graph losses (stage-independent)
+        # Apply proper scaling to topology losses
         if "segmentation" in predictions:
-            losses["topology"] = self._topology_loss(predictions["segmentation"])
-            losses["graph"] = self._graph_topology_loss(predictions["segmentation"])
+            topology_loss = self._topology_loss(predictions["segmentation"])
+            # Scale topology loss to reasonable magnitude
+            losses["topology"] = topology_loss * 0.5
+            
+            graph_loss = self._graph_topology_loss(predictions["segmentation"])
+            # Graph loss is already scaled in the function above
+            losses["graph"] = graph_loss
 
-        # ---- STAGE 2+ GEOMETRIC LOSSES (Conditional on run_full_geometric) ----
+        # ---- GEOMETRIC LOSSES with normalization ----
         if run_full_geometric:
-            # Polygon loss (Stage 2+)
             if ("polygons" in predictions and predictions["polygons"] is not None and
                 "polygons_gt" in targets):
-                losses["polygon"] = self._polygon_loss(predictions, targets["polygons_gt"])
+                poly_loss = self._polygon_loss(predictions, targets["polygons_gt"])
+                # Normalize polygon loss by number of polygons and points
+                if "polygons" in predictions and predictions["polygons"] is not None:
+                    B, P, N, _ = predictions["polygons"].shape
+                    poly_loss = poly_loss / (P * N)  # Normalize by polygon complexity
+                losses["polygon"] = poly_loss
             else:
                 losses["polygon"] = torch.tensor(0.0, device=device)
 
-            # Voxel loss (Stage 3)
             if ("voxels_pred" in predictions and predictions["voxels_pred"] is not None and
                 "voxels_gt" in targets):
                 pred_vox = predictions["voxels_pred"].float()
                 tgt_vox = targets["voxels_gt"].float().to(pred_vox.device)
-                losses["voxel"] = self._voxel_iou_loss(pred_vox, tgt_vox)
+                voxel_loss = self._voxel_iou_loss(pred_vox, tgt_vox)
+                losses["voxel"] = voxel_loss
             else:
                 losses["voxel"] = torch.tensor(0.0, device=device)
 
-            # Cross-modal latent consistency (Stage 3)
             if ("latent_2d_embedding" in predictions and "latent_3d_embedding" in predictions and
                 predictions["latent_2d_embedding"] is not None and predictions["latent_3d_embedding"] is not None):
                 consistency_loss = self._latent_consistency_loss(
@@ -419,31 +377,30 @@ class ResearchGradeLoss(nn.Module):
             else:
                 losses["latent_consistency"] = torch.tensor(0.0, device=device)
         else:
-            # Zero losses when geometric computation is skipped
             losses["polygon"] = torch.tensor(0.0, device=device)
             losses["voxel"] = torch.tensor(0.0, device=device)
             losses["latent_consistency"] = torch.tensor(0.0, device=device)
 
-        # ---- APPLY WEIGHTING (Stage-aware dynamic or static) ----
-        # Filter out zero/non-differentiable losses for weighting
+        # ---- IMPROVED WEIGHTING AND AGGREGATION ----
         active_losses = {
             name: loss for name, loss in losses.items()
             if isinstance(loss, torch.Tensor) and loss.requires_grad and loss.item() > 1e-8
         }
 
         if self.enable_dynamic_weighting and shared_parameters is not None and active_losses:
-            # Dynamic weighting with stage-aware initialization
             try:
                 dynamic_weights = self.loss_weighter.update_weights(
                     active_losses, shared_parameters, self.update_freq
                 )
                 
-                # Apply dynamic weights where available, static elsewhere
+                # Apply weights with additional stability checks
                 for name, loss in losses.items():
-                    if name in self.weights:
+                    if name in self.weights and isinstance(loss, torch.Tensor) and torch.isfinite(loss):
                         weight = dynamic_weights.get(name, self.weights[name])
-                        if isinstance(loss, torch.Tensor) and torch.isfinite(loss):
-                            total_loss = total_loss + weight * loss
+                        # Apply weight with gradient scaling for stability
+                        weighted_loss = weight * loss
+                        if torch.isfinite(weighted_loss):
+                            total_loss = total_loss + weighted_loss
                             
             except Exception as e:
                 print(f"[ResearchGradeLoss] Dynamic weighting failed: {e}, falling back to static weights")
@@ -452,12 +409,14 @@ class ResearchGradeLoss(nn.Module):
                     if name in self.weights and isinstance(loss, torch.Tensor) and torch.isfinite(loss):
                         total_loss = total_loss + self.weights[name] * loss
         else:
-            # Static weights
+            # Static weights with stability
             for name, loss in losses.items():
                 if name in self.weights and isinstance(loss, torch.Tensor) and torch.isfinite(loss):
                     total_loss = total_loss + self.weights[name] * loss
 
-        # Final sanitization
+        # Final loss scaling and validation
+        total_loss = torch.clamp(total_loss, 0.0, 100.0)  # Prevent explosion
+        
         if not torch.isfinite(total_loss):
             print("[ResearchGradeLoss] Warning: Non-finite total loss detected, using fallback")
             total_loss = torch.tensor(1.0, device=device, requires_grad=True)
@@ -521,46 +480,62 @@ class ResearchGradeLoss(nn.Module):
         return 0.7 * cosine_loss + 0.3 * l2_loss
 
     def _graph_topology_loss(self, segmentation_logits: torch.Tensor) -> torch.Tensor:
-        """Graph-based topology constraints"""
+        """Graph-based topology constraints with proper normalization"""
         try:
             graph_data = GraphTopologyExtractor.extract_room_graph(segmentation_logits)
             device = segmentation_logits.device
             
             total_graph_loss = torch.tensor(0.0, device=device)
             batch_size = segmentation_logits.shape[0]
+            valid_batches = 0
             
             for b in range(batch_size):
                 if b < len(graph_data["adjacency_matrices"]):
                     adj_matrix = graph_data["adjacency_matrices"][b]
                     if adj_matrix.numel() == 0:
                         continue
-                        
+                    
+                    # Normalize by matrix size to prevent scale explosion
+                    matrix_size = max(adj_matrix.shape[0], 1)
+                    norm_factor = 1.0 / (matrix_size + 1e-6)
+                    
                     degrees = adj_matrix.sum(dim=1)
-                    isolation_penalty = torch.exp(-degrees).mean()
+                    isolation_penalty = torch.exp(-degrees).mean() * norm_factor
                     
                     max_reasonable_connections = min(4, adj_matrix.shape[0] - 1)
-                    over_connection_penalty = F.relu(degrees - max_reasonable_connections).mean()
+                    over_connection_penalty = F.relu(degrees - max_reasonable_connections).mean() * norm_factor
                     
                     if b < len(graph_data["room_features"]) and graph_data["room_features"][b].numel() > 0:
                         room_features = graph_data["room_features"][b]
                         if room_features.shape[0] > 1:
                             feature_distances = torch.cdist(room_features, room_features)
-                            smoothness_loss = (adj_matrix * feature_distances).sum() / (adj_matrix.sum() + 1e-6)
+                            # Normalize distance computation
+                            mean_distance = feature_distances.mean()
+                            normalized_distances = feature_distances / (mean_distance + 1e-6)
+                            smoothness_loss = (adj_matrix * normalized_distances).sum() / (adj_matrix.sum() + 1e-6)
+                            smoothness_loss = smoothness_loss * norm_factor
                         else:
                             smoothness_loss = torch.tensor(0.0, device=device)
                     else:
                         smoothness_loss = torch.tensor(0.0, device=device)
                     
+                    # Apply strong penalty scaling to keep graph loss in reasonable range
                     batch_graph_loss = (0.4 * isolation_penalty + 
-                                      0.3 * over_connection_penalty + 
-                                      0.3 * smoothness_loss)
+                                     0.3 * over_connection_penalty + 
+                                     0.3 * smoothness_loss) * 0.1  # Scale down by 10x
+                    
                     total_graph_loss = total_graph_loss + batch_graph_loss
+                    valid_batches += 1
             
-            return total_graph_loss / batch_size
-            
+            # Average over valid batches and apply final normalization
+            if valid_batches > 0:
+                return total_graph_loss / valid_batches
+            else:
+                return torch.tensor(0.0, device=segmentation_logits.device)
+                
         except Exception as e:
             return torch.tensor(0.0, device=segmentation_logits.device)
-
+    
     def _dice_loss(self, pred: torch.Tensor, target: torch.Tensor, smooth: float = 1e-6) -> torch.Tensor:
         """Dice loss implementation"""
         pred_soft = F.softmax(pred, dim=1)

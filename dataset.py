@@ -63,7 +63,7 @@ class AdvancedFloorPlanDataset(Dataset):
             estimated_mb = self._estimate_memory_usage()
             print(f"[DATA] Estimated memory usage: {estimated_mb:.1f} MB")
             
-            start_time = time.time()
+            start_time = time.time() 
             self._preload_cache()
             load_time = time.time() - start_time
             print(f"[DATA] Cache preloading completed in {load_time:.2f}s")
@@ -81,6 +81,11 @@ class AdvancedFloorPlanDataset(Dataset):
         mask_bytes = H * W  # grayscale uint8  
         voxel_bytes = self.voxel_size ** 3 * 4  # float32
         json_bytes = 1024  # rough estimate for params + polygons
+        
+        if self.voxel_size >= 128:
+            voxel_gb = (voxel_bytes * n_samples) / (1024**3)
+            print(f"[WARNING] Large voxel grid ({self.voxel_size}^3) may lead to high memory usage: {voxel_gb:.2f} GB just for voxels")
+            print("[Warning] Consider reducing voxel_size or disabling cache_in_memory.")
         
         total_per_sample = image_bytes + mask_bytes + voxel_bytes + json_bytes
         total_mb = (total_per_sample * n_samples) / (1024 * 1024)
@@ -233,7 +238,9 @@ class AdvancedFloorPlanDataset(Dataset):
         image = image.astype(np.float32) / 255.0
         
         # Clean mask (remove class 5 if present)
-        mask[mask == 5] = 0
+        if np.any(mask == 5):
+            print(f"WARNING: Found class 5 in sample {idx}. Verify this class should be removed!")
+        mask[mask == 5] = 0    
 
         # Convert to tensors
         image_tensor = torch.from_numpy(image).float().permute(2, 0, 1)
