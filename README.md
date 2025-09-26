@@ -35,9 +35,7 @@ neural-geometric-3d/
 ├── requirements.txt             # Python dependencies
 ├── README.md                    # This file
 ├── train.py                     # Main training script
-├── infer.py                     # Main inference script
-├── evaluate.py                  # Model evaluation script
-├── demo.py                      # Demo script
+├── evaluate.py                  # Model evaluation script                    
 │
 ├── models/                      # Model architecture components
 │   ├── __init__.py
