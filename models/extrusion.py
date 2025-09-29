@@ -91,7 +91,7 @@ class DifferentiableExtrusion(nn.Module):
     Converts polygons + attributes to soft 3D occupancy grids
     """
 
-    def __init__(self, voxel_size: int = 64):
+    def __init__(self, voxel_size: int = 96):
         super().__init__()
         self.voxel_size = int(voxel_size)
         self.register_buffer("_coords", None)

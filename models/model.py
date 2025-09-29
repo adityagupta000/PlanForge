@@ -180,14 +180,14 @@ class NeuralGeometric3DGenerator(nn.Module):
         self,
         input_channels=3,
         num_classes=5,
-        feature_dim=512,
+        feature_dim=768,
         num_attributes=6,
-        voxel_size=64,
-        max_polygons=20,
-        max_points=50,
+        voxel_size=96,
+        max_polygons=30,
+        max_points=64,
         use_latent_consistency=True,
         use_graph_constraints=True,
-        latent_embedding_dim=256,
+        latent_embedding_dim=384,
     ):
         super().__init__()
 

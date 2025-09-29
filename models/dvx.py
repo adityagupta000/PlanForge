@@ -21,11 +21,11 @@ import torch.nn.functional as F
 class DifferentiableVectorization(nn.Module):
     def __init__(
         self,
-        max_polygons: int = 20,
-        max_points: int = 50,
-        feature_dim: int = 256,
-        displacement_scale: float = 0.12,
-        num_refinement_steps: int = 3,
+        max_polygons: int = 30,
+        max_points: int = 64,
+        feature_dim: int = 384,
+        displacement_scale: float = 0.10,
+        num_refinement_steps: int = 4,
         align_corners: bool = False,
         padding_mode: str = "border",  # options for grid_sample
         use_proj_conv: bool = True,
