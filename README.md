@@ -38,7 +38,6 @@ neural-geometric-3d/
 ├── evaluate.py                  # Model evaluation script                    
 │
 ├── models/                      # Model architecture components
-│   ├── __init__.py
 │   ├── encoder.py               # Multi-scale encoder backbone
 │   ├── heads.py                 # Prediction heads (segmentation, attributes, SDF)
 │   ├── dvx.py                   # Differentiable Vectorization module
@@ -46,20 +45,16 @@ neural-geometric-3d/
 │   └── model.py                 # Main model definition
 │
 ├── training/                    # Training system
-│   ├── __init__.py
 │   ├── losses.py                # Advanced loss functions
 │   └── trainer.py               # Multi-stage training system
 │
 ├── inference/                   # Inference system
-│   ├── __init__.py
 │   └── engine.py                # Research-grade inference engine
 │
 ├── evaluation/                  # Evaluation utilities
-│   ├── __init__.py
 │   └── metrics.py               # Evaluation metrics and utilities
 │
 └── utils/                       # Utility functions
-    ├── __init__.py
     └── visualization.py          # Visualization and utility functions
 ```
 

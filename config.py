@@ -50,7 +50,7 @@ class ModelConfig:
 class CurriculumConfig:
     """Dynamic curriculum learning configuration"""
     use_dynamic_curriculum: bool = True
-    stage_switch_patience: int = 5
+    stage_switch_patience: int = 4
     min_improvement_threshold: float = 0.001
     plateau_detection_window: int = 3
 
@@ -70,7 +70,7 @@ class CurriculumConfig:
     dvx_step_freq: int = 1                      # Run DVX every step
     persistent_workers: bool = True
     prefetch_factor: int = 6
-    num_workers: int = 16
+    num_workers: int = 16                       #increase if more computation allows 
     
     # Progressive resolution (now higher base resolution)
     voxel_size_stage: Dict[str, int] = None
@@ -132,9 +132,9 @@ class TrainingConfig:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     
     # Reduced epoch counts due to higher batch size and faster convergence
-    max_stage1_epochs: int = 30                 # Reduced from 40
-    max_stage2_epochs: int = 20                 # Reduced from 25
-    max_stage3_epochs: int = 45                 # Reduced from 60
+    max_stage1_epochs: int = 50                 # Reduced from 40
+    max_stage2_epochs: int = 30                 # Reduced from 25
+    max_stage3_epochs: int = 65                 # Reduced from 60
     
     min_stage1_epochs: int = 6                  # Reduced from 8
     min_stage2_epochs: int = 4                  # Reduced from 5
