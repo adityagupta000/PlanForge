@@ -83,7 +83,7 @@ class CurriculumConfig:
     
     # Graph constraint scheduling
     graph_weight_schedule: str = "delayed_ramp"
-    graph_start_epoch: int = 15
+    graph_start_epoch: int = 5
     graph_end_weight: float = 0.25
     
     def __post_init__(self):
@@ -144,7 +144,7 @@ class TrainingConfig:
     # Advanced training techniques
     use_mixed_precision: bool = True
     use_cosine_restarts: bool = True
-    warmup_epochs: int = 5
+    warmup_epochs: int = 2
     grad_clip_norm: float = 1.0
     
     # Gradient monitoring for dynamic weighting
@@ -152,7 +152,7 @@ class TrainingConfig:
     gradient_norm_window: int = 10  # rolling window for gradient tracking
     
     # Checkpointing
-    checkpoint_freq: int = 1
+    checkpoint_freq: int = 4
     
     # Curriculum configuration
     curriculum: CurriculumConfig = None
