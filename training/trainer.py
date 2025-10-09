@@ -8,7 +8,7 @@ import torch
 import torch.nn.utils
 
 # training/trainer.py - Fixed AMP imports
-from torch.amp import autocast, GradScaler
+from torch.cuda.amp import autocast, GradScaler
 import time
 import numpy as np
 import random
@@ -130,7 +130,7 @@ class AdaptiveMultiStageTrainer:
 
         # Add AMP and optimization settings - Updated for new PyTorch API
         self.use_amp = getattr(config, "use_mixed_precision", True)
-        self.scaler = GradScaler("cuda", enabled=self.use_amp)
+        self.scaler = GradScaler(enabled=self.use_amp)
         self.accumulation_steps = getattr(config, "accumulation_steps", 1)
         self.dvx_step_freq = getattr(config, "dvx_step_freq", 1)
         self.voxel_size_stage = getattr(config, "voxel_size_stage", None)
@@ -309,7 +309,8 @@ class AdaptiveMultiStageTrainer:
                 (mode == "stage1" and self._step % 2 == 0)  # Every 4th step in stage 1
             )
 
-            with autocast("cuda", enabled=self.use_amp):
+            with autocast(enabled=self.use_amp):
+
                 predictions = self.model(
                     batch["image"], run_full_geometric=run_full_geometric
                 )
@@ -330,31 +331,45 @@ class AdaptiveMultiStageTrainer:
                 )
 
                 # Scale for accumulation
-                loss = loss / self.accumulation_steps
+                if self.accumulation_steps > 1:
+                    loss = loss / self.accumulation_steps
                 accumulated_loss += loss.item()
 
             # Backward pass with stability
             self.scaler.scale(loss).backward()
 
             # Gradient accumulation and update
+            # Gradient accumulation and update
             if ((batch_idx + 1) % self.accumulation_steps) == 0:
-                # Enhanced gradient clipping
-                self.scaler.unscale_(optimizer)
-                
-                # Adaptive gradient clipping based on loss magnitude
-                max_grad_norm = min(self.config.grad_clip_norm * (1.0 + accumulated_loss), 2.0)
-                torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(), max_grad_norm
+                # Check if there are any gradients to unscale
+                has_grads = any(
+                    p.grad is not None 
+                    for p in self.model.parameters() 
+                    if p.requires_grad
                 )
-
-                self.scaler.step(optimizer)
-                self.scaler.update()
+    
+                if has_grads:
+                    # Enhanced gradient clipping
+                    self.scaler.unscale_(optimizer)
+                    
+                    # Adaptive gradient clipping based on loss magnitude
+                    max_grad_norm = min(self.config.grad_clip_norm * (1.0 + accumulated_loss), 2.0)
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(), max_grad_norm
+                    )
+                    
+                    self.scaler.step(optimizer)
+                    self.scaler.update()
+                else:
+                    # Skip optimizer step if no gradients
+                    pass
+                
                 optimizer.zero_grad()
                 
                 # Reset accumulation
                 accumulated_loss = 0.0
 
-            current_loss = loss.item() * self.accumulation_steps
+            current_loss = loss.item() * (self.accumulation_steps if self.accumulation_steps > 1 else 1)
             total_loss += current_loss
 
             # Track components with better averaging
@@ -409,6 +424,10 @@ class AdaptiveMultiStageTrainer:
         if mode == "stage1":
             return {"mask": batch["mask"], "attributes": batch["attributes"]}
         elif mode == "stage2":
+            if "polygons_gt" not in batch:
+                print(f"Warning: polygons_gt missing in batch for {mode}")
+                return {"mask": batch.get("mask"), "attributes": batch.get("attributes")}
+        
             return {
                 "polygons_gt": {
                     "polygons": batch["polygons_gt"]["polygons"].to(self.device),
@@ -416,15 +435,21 @@ class AdaptiveMultiStageTrainer:
                 }
             }
         else:  # stage3
-            return {
+            targets = {
                 "mask": batch["mask"],
                 "attributes": batch["attributes"],
-                "voxels_gt": batch["voxels_gt"],
-                "polygons_gt": {
-                    "polygons": batch["polygons_gt"]["polygons"].to(self.device),
-                    "valid_mask": batch["polygons_gt"]["valid_mask"].to(self.device),
-                },
             }
+        
+            if "voxels_gt" in batch:
+                targets["voxels_gt"] = batch["voxels_gt"]
+        
+            if "polygons_gt" in batch:
+             targets["polygons_gt"] = {
+                "polygons": batch["polygons_gt"]["polygons"].to(self.device),
+                "valid_mask": batch["polygons_gt"]["valid_mask"].to(self.device),
+                }
+        
+            return targets
 
     def _validate(self, mode="stage1"):
         """Enhanced validation with consistent loss computation"""
@@ -444,11 +469,14 @@ class AdaptiveMultiStageTrainer:
                     for k, v in batch.items()
                 }
 
-                with autocast("cuda", enabled=self.use_amp):
+                with autocast(enabled=self.use_amp):
+
                     # ALWAYS run full geometric in validation for consistency
+                    run_full = (mode == "stage3")
                     predictions = self.model(batch["image"], run_full_geometric=True)
 
-                    targets = self._prepare_targets(batch, "stage3")  # Use full targets
+                    # Use appropriate targets for current stage
+                    targets = self._prepare_targets(batch, mode)  # Use full targets
 
                     # Use same loss computation as training but without dynamic weighting
                     loss, loss_components = self.loss_fn(
@@ -894,20 +922,23 @@ class AdaptiveMultiStageTrainer:
                 # Torch RNG (CPU)
                 if "torch" in rs and rs["torch"] is not None:
                     torch_state = rs["torch"]
-                    if torch.is_tensor(torch_state) and torch_state.dtype == torch.uint8:
-                        torch.set_rng_state(torch_state)
+                    if torch.is_tensor(torch_state):
+                        if torch_state.dtype == torch.uint8:
+                            torch.set_rng_state(torch_state)
+                        else:
+                            torch.set_rng_state(torch_state.byte())
                     else:
-                        torch.set_rng_state(torch.tensor(torch_state, dtype=torch.uint8))
-
+                        torch.set_rng_state(torch.ByteTensor(torch_state))
+                        
                 # CUDA RNG (all devices)
                 if "cuda" in rs and rs["cuda"] is not None and torch.cuda.is_available():
                     cuda_state = rs["cuda"]
                     cuda_tensors = []
                     for s in cuda_state:
-                        if torch.is_tensor(s) and s.dtype == torch.uint8:
-                            cuda_tensors.append(s)
+                        if torch.is_tensor(s):
+                            cuda_tensors.append(s.byte() if s.dtype != torch.uint8 else s)
                         else:
-                            cuda_tensors.append(torch.tensor(s, dtype=torch.uint8))
+                            cuda_tensors.append(torch.ByteTensor(s))
                     torch.cuda.set_rng_state_all(cuda_tensors)
 
                 # NumPy RNG

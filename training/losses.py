@@ -42,6 +42,11 @@ class DynamicLossWeighter:
         for name, loss in task_losses.items():
             if name not in self.initial_task_losses:
                 loss_val = loss.item() if torch.is_tensor(loss) else float(loss)
+                
+                 # Skip initialization for zero/inactive losses
+                if abs(loss_val) < 1e-8:
+                    continue
+                
                 # Use log-scale initialization for stability
                 self.initial_task_losses[name] = max(np.log(abs(loss_val) + 1e-6), -10.0)
                 
@@ -356,7 +361,7 @@ class ResearchGradeLoss(nn.Module):
                     poly_loss = poly_loss / (P * N)  # Normalize by polygon complexity
                 losses["polygon"] = poly_loss
             else:
-                losses["polygon"] = torch.tensor(0.0, device=device)
+                losses["polygon"] = torch.tensor(0.0, device=device, requires_grad=True)
 
             if ("voxels_pred" in predictions and predictions["voxels_pred"] is not None and
                 "voxels_gt" in targets):
@@ -365,7 +370,7 @@ class ResearchGradeLoss(nn.Module):
                 voxel_loss = self._voxel_iou_loss(pred_vox, tgt_vox)
                 losses["voxel"] = voxel_loss
             else:
-                losses["voxel"] = torch.tensor(0.0, device=device)
+                losses["voxel"] = torch.tensor(0.0, device=device, requires_grad=True)
 
             if ("latent_2d_embedding" in predictions and "latent_3d_embedding" in predictions and
                 predictions["latent_2d_embedding"] is not None and predictions["latent_3d_embedding"] is not None):
@@ -375,11 +380,11 @@ class ResearchGradeLoss(nn.Module):
                 )
                 losses["latent_consistency"] = consistency_loss
             else:
-                losses["latent_consistency"] = torch.tensor(0.0, device=device)
+                losses["latent_consistency"] = torch.tensor(0.0, device=device, requires_grad=True)
         else:
-            losses["polygon"] = torch.tensor(0.0, device=device)
-            losses["voxel"] = torch.tensor(0.0, device=device)
-            losses["latent_consistency"] = torch.tensor(0.0, device=device)
+            losses["polygon"] = torch.tensor(0.0, device=device, requires_grad=True)
+            losses["voxel"] = torch.tensor(0.0, device=device, requires_grad=True)
+            losses["latent_consistency"] = torch.tensor(0.0, device=device, requires_grad=True)
 
         # ---- IMPROVED WEIGHTING AND AGGREGATION ----
         active_losses = {
@@ -417,11 +422,18 @@ class ResearchGradeLoss(nn.Module):
         # Final loss scaling and validation
         total_loss = torch.clamp(total_loss, 0.0, 100.0)  # Prevent explosion
         
+        # Final loss scaling and validation
         if not torch.isfinite(total_loss):
-            print("[ResearchGradeLoss] Warning: Non-finite total loss detected, using fallback")
-            total_loss = torch.tensor(1.0, device=device, requires_grad=True)
+            print("[ResearchGradeLoss] Warning: Non-finite total loss detected")
+            # Return a small valid loss instead of failing
+            total_loss = torch.tensor(0.01, device=device, requires_grad=True)
+            # Also mark this in losses dict
+            losses["total"] = total_loss
+            losses["invalid_loss_detected"] = True
+        else:
+            total_loss = torch.clamp(total_loss, 0.0, 100.0)
+            losses["total"] = total_loss
 
-        losses["total"] = total_loss
         return total_loss, losses
 
     def __call__(self, predictions: dict, targets: dict, shared_parameters=None, run_full_geometric=True):
@@ -566,10 +578,17 @@ class ResearchGradeLoss(nn.Module):
             try:
                 dist_inside = cv2.distanceTransform((mask_np > 0).astype(np.uint8), cv2.DIST_L2, 5)
                 dist_outside = cv2.distanceTransform((mask_np == 0).astype(np.uint8), cv2.DIST_L2, 5)
+
+                dist_inside=np.clip(dist_inside, 0, 50)
+                dist_outside=np.clip(dist_outside, 0, 50)
+
                 sdf_np = dist_inside.astype(np.float32) - dist_outside.astype(np.float32)
-                sdf_np = np.tanh(sdf_np / 10.0).astype(np.float32)
+                sdf_np = np.tanh(sdf_np / 20.0).astype(np.float32)
+
+                sdf_np=np.clip(sdf_np,-1.0,1.0)
                 sdf[b, 0] = torch.from_numpy(sdf_np)
-            except Exception:
+            except Exception as e:
+                print(f"SDF Computation failed for batch{b}:{e}")
                 sdf[b, 0] = torch.zeros_like(mask[b].float())
 
         return sdf

@@ -104,7 +104,9 @@ class DifferentiableVectorization(nn.Module):
             return self._proj_convs[key]
 
         if in_channels != self.feature_dim:
-            conv = nn.Conv2d(in_channels, self.feature_dim, kernel_size=1, stride=1, padding=0)
+            # Get device from any existing parameter, fallback to CPU
+            device = next(self.parameters()).device if len(list(self.parameters())) > 0 else 'cpu'
+            conv = nn.Conv2d(in_channels, self.feature_dim, kernel_size=1, stride=1, padding=0).to(device)
             # initialize conv: kaiming
             nn.init.kaiming_normal_(conv.weight, a=0.2)
             if conv.bias is not None:

@@ -39,7 +39,7 @@ def plot_curriculum_analysis(history, save_path="curriculum_analysis.png"):
         
         # Extract transition epochs and reasons
         transition_epochs = [t["epoch"] for t in transitions]
-        transition_stages = [t["from_stage"] + " → " + t["to_stage"] for t in transitions]
+        transition_stages = [f"Stage {t['from_stage']} → {t['from_stage']+1}" for t in transitions]
         transition_reasons = [t.get("reason", "threshold") for t in transitions]
         
         # Create timeline

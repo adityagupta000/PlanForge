@@ -85,6 +85,7 @@ class SegmentationHead(nn.Module):
         seg = self.decoder[-1](x)
         
         # Upsample to original resolution
+        seg=torch.clamp(seg, min=-10.0, max=10.0)
         return F.interpolate(seg, scale_factor=4, mode="bilinear", align_corners=False)
 
 

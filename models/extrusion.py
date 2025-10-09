@@ -181,7 +181,7 @@ class DifferentiableExtrusion(nn.Module):
 
         for b in range(B):
             # pick identifier if available
-            sid = sample_ids[b] if sample_ids is not None else b
+            sid = str(sample_ids[b]) if sample_ids is not None else str(b)
 
             # Sanitize height with logging
             wall_height_normalized = attributes[b, 0]
@@ -366,7 +366,7 @@ class DifferentiableExtrusionFast(nn.Module):
 
             # Sanitize height
             wall_height_normalized = attributes[b, 0]
-            sanitized_norm = _sanitize_normalized_height(wall_height_normalized, sample_id=b, default=0.6)
+            sanitized_norm = _sanitize_normalized_height(wall_height_normalized, sample_id=str(b), default=0.6)
             wall_height_m = sanitized_norm * 5.0
             height_frac = wall_height_m / 5.0
             height_voxels = int(round(height_frac * D))

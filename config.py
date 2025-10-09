@@ -30,7 +30,7 @@ class ModelConfig:
     num_attributes: int = 6
     voxel_size: int = 96                        # Match DataConfig
     max_polygons: int = 30                      # Increased from 20 for complex layouts
-    max_points: int = 64                        # Increased from 50 for finer polygons
+    max_points: int = 100                        # Increased from 50 for finer polygons
     dropout: float = 0.15                       # Slightly higher for larger model
     use_attention: bool = True
     use_deep_supervision: bool = True
@@ -142,20 +142,20 @@ class TrainingConfig:
     
     # Learning rates - Higher for larger batches (batch_size=16 vs 4)
     # Using square root scaling: LR_new = LR_old * sqrt(batch_new/batch_old)
-    stage1_lr: float = 6e-4                     # Scaled from 3e-4 (sqrt(16/4) = 2x)
+    stage1_lr: float = 3e-4                     # Scaled from 3e-4 (sqrt(16/4) = 2x)
     stage1_weight_decay: float = 5e-6           # Slightly lower with larger batch
     
-    stage2_lr: float = 2e-4                     # Scaled from 1e-4
+    stage2_lr: float = 1e-4                     # Scaled from 1e-4
     stage2_weight_decay: float = 5e-6
     
-    stage3_lr: float = 1e-4                     # Scaled from 5e-5
+    stage3_lr: float = 5e-4                     # Scaled from 5e-5
     stage3_weight_decay: float = 5e-6
     
     # Advanced training techniques
     use_mixed_precision: bool = True            # Critical for 48GB efficiency
     use_cosine_restarts: bool = True
     warmup_epochs: int = 3                      # Slightly longer warmup
-    grad_clip_norm: float = 1.5                 # Higher for larger model
+    grad_clip_norm: float = 1.0              # Higher for larger model
     
     # Gradient monitoring
     track_gradient_norms: bool = True
