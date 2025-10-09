@@ -277,9 +277,9 @@ def main():
     args = parser.parse_args()
 
     # Setup device
-    device = torch.device(args.device) if args.device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device.type}")
-
+    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    
     import torch.backends.cudnn as cudnn
     if device == "cuda":
         cudnn.benchmark = True

@@ -38,9 +38,8 @@ class MultiScaleEncoder(nn.Module):
     Based on ResNet architecture with Feature Pyramid Network (FPN)
     """
 
-    def __init__(self, input_channels=3, feature_dim=768):
+    def __init__(self, input_channels=3, feature_dim=512):
         super().__init__()
-        self.feature_dim = feature_dim
 
         # Stem
         self.stem = nn.Sequential(

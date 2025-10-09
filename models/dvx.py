@@ -21,11 +21,11 @@ import torch.nn.functional as F
 class DifferentiableVectorization(nn.Module):
     def __init__(
         self,
-        max_polygons: int = 30,
-        max_points: int = 64,
-        feature_dim: int = 384,
-        displacement_scale: float = 0.10,
-        num_refinement_steps: int = 4,
+        max_polygons: int = 20,
+        max_points: int = 50,
+        feature_dim: int = 256,
+        displacement_scale: float = 0.12,
+        num_refinement_steps: int = 3,
         align_corners: bool = False,
         padding_mode: str = "border",  # options for grid_sample
         use_proj_conv: bool = True,
@@ -104,9 +104,7 @@ class DifferentiableVectorization(nn.Module):
             return self._proj_convs[key]
 
         if in_channels != self.feature_dim:
-            # Get device from any existing parameter, fallback to CPU
-            device = next(self.parameters()).device if len(list(self.parameters())) > 0 else 'cpu'
-            conv = nn.Conv2d(in_channels, self.feature_dim, kernel_size=1, stride=1, padding=0).to(device)
+            conv = nn.Conv2d(in_channels, self.feature_dim, kernel_size=1, stride=1, padding=0)
             # initialize conv: kaiming
             nn.init.kaiming_normal_(conv.weight, a=0.2)
             if conv.bias is not None:

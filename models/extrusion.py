@@ -91,7 +91,7 @@ class DifferentiableExtrusion(nn.Module):
     Converts polygons + attributes to soft 3D occupancy grids
     """
 
-    def __init__(self, voxel_size: int = 96):
+    def __init__(self, voxel_size: int = 64):
         super().__init__()
         self.voxel_size = int(voxel_size)
         self.register_buffer("_coords", None)
@@ -181,7 +181,7 @@ class DifferentiableExtrusion(nn.Module):
 
         for b in range(B):
             # pick identifier if available
-            sid = str(sample_ids[b]) if sample_ids is not None else str(b)
+            sid = sample_ids[b] if sample_ids is not None else b
 
             # Sanitize height with logging
             wall_height_normalized = attributes[b, 0]
@@ -366,7 +366,7 @@ class DifferentiableExtrusionFast(nn.Module):
 
             # Sanitize height
             wall_height_normalized = attributes[b, 0]
-            sanitized_norm = _sanitize_normalized_height(wall_height_normalized, sample_id=str(b), default=0.6)
+            sanitized_norm = _sanitize_normalized_height(wall_height_normalized, sample_id=b, default=0.6)
             wall_height_m = sanitized_norm * 5.0
             height_frac = wall_height_m / 5.0
             height_voxels = int(round(height_frac * D))

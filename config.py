@@ -1,6 +1,6 @@
 """
 Configuration settings for the Neural-Geometric 3D Model Generator
-OPTIMIZED FOR 48GB GPU - Maximizes throughput and model capacity
+Enhanced with dynamic curriculum and adaptive training strategies
 """
 from dataclasses import dataclass
 from typing import Tuple, Dict, Any, Optional, List
@@ -9,102 +9,85 @@ import torch
 
 @dataclass
 class DataConfig:
-    """Data configuration - Optimized for high-end GPU"""
+    """Data-related configuration"""
     data_dir: str = "./data/floorplans"
-    image_size: Tuple[int, int] = (384, 384)   # Increased from 256 for better detail
-    voxel_size: int = 96                        # Increased from 64 for finer 3D resolution
-    batch_size: int = 12                        # Increased from 4 (48GB can handle this)
-    num_workers: int = 16                       # Increased for faster data loading
+    image_size: Tuple[int, int] = (256, 256)   # keep full resolution for accuracy
+    voxel_size: int = 64
+    batch_size: int = 4                        # balance speed & memory
+    num_workers: int = 8                       # faster dataloader (tune per CPU)
     augment: bool = True
-    pin_memory: bool = True                     # Critical for fast GPU transfer
-    persistent_workers: bool = True             # Keep workers alive between epochs
-    prefetch_factor: int = 4                    # Prefetch 4 batches per worker
 
 
 @dataclass
 class ModelConfig:
-    """Model architecture - Enhanced capacity for 48GB GPU"""
+    """Model architecture configuration optimized for high accuracy"""
     input_channels: int = 3
     num_classes: int = 5
-    feature_dim: int = 768                      # Increased from 512 (50% more capacity)
+    feature_dim: int = 512     # reduced from 768 → faster while keeping strong accuracy
     num_attributes: int = 6
-    voxel_size: int = 96                        # Match DataConfig
-    max_polygons: int = 30                      # Increased from 20 for complex layouts
-    max_points: int = 100                        # Increased from 50 for finer polygons
-    dropout: float = 0.15                       # Slightly higher for larger model
+    voxel_size: int = 64
+    max_polygons: int = 20     # enough for complex layouts
+    max_points: int = 50       # good detail without huge cost
+    dropout: float = 0.05
     use_attention: bool = True
     use_deep_supervision: bool = True
     
-    # Auxiliary heads
+    # Auxiliary heads for novel training strategies
     use_latent_consistency: bool = True
     use_graph_constraints: bool = True
-    latent_embedding_dim: int = 384             # Increased from 256
-    
-    # DVX configuration
-    dvx_displacement_scale: float = 0.10        # Slightly tighter for precision
-    dvx_num_refinement_steps: int = 4           # Increased from 3
-    dvx_feature_dim: int = 384                  # Match higher capacity
+    latent_embedding_dim: int = 256
 
 
 @dataclass 
 class CurriculumConfig:
     """Dynamic curriculum learning configuration"""
+    # Adaptive stage transitioning
     use_dynamic_curriculum: bool = True
-    stage_switch_patience: int = 4
+    stage_switch_patience: int = 5
     min_improvement_threshold: float = 0.001
     plateau_detection_window: int = 3
 
+    # GradNorm / gradient tracking
     gradient_norm_window: int = 100
+
+    # Objectives for multi-objective optimization
     objectives: Optional[List[str]] = None
 
-    # Topology scheduling
-    topology_schedule: str = "progressive"
+    # Topology-aware scheduling
+    topology_schedule: str = "progressive"   # "progressive", "linear_ramp", "exponential"
     topology_start_weight: float = 0.1
     topology_end_weight: float = 1.0
-    topology_ramp_epochs: int = 15              # Faster ramp with more data throughput
+    topology_ramp_epochs: int = 20
     
-    # Mixed precision and optimization
-    use_mixed_precision: bool = True            # Essential for 48GB efficiency
-    cache_in_memory: bool = True                # 48GB GPU + system RAM can cache dataset
-    accumulation_steps: int = 1                 # No accumulation needed with batch_size=16
-    dvx_step_freq: int = 1                      # Run DVX every step
-    persistent_workers: bool = True
-    prefetch_factor: int = 6
-    num_workers: int = 16                       #increase if more computation allows 
+    # config.py (snippet — add into the existing config class/dict)
+    # Mixed precision and training conveniences
+    use_mixed_precision = True            # enable AMP
+    cache_in_memory = False               # set True if host RAM can hold dataset
+    accumulation_steps = 1                # effective batch size multiplier
+    dvx_step_freq = 1                     # run DVX refinement every N steps (1 = every step)
+    persistent_workers = True             # DataLoader persistent workers
+    prefetch_factor = 4                   # DataLoader prefetch
+    num_workers = 8                       # default num workers for DataLoader (tune by CPU)
+    # Progressive resolution settings (example)
+    voxel_size_stage = { "stage1": 32, "stage2": 32, "stage3": 64 }  # voxel sizes per stage
+    image_size_stage = { "stage1": (128,128), "stage2": (192,192), "stage3": (256,256)}
+
     
-    # Progressive resolution (now higher base resolution)
-    voxel_size_stage: Dict[str, int] = None
-    image_size_stage: Dict[str, Tuple[int, int]] = None
-    
-    # Loss scheduling
+    # Loss component scheduling
     loss_schedule: Dict[str, str] = None
     
     # Multi-objective optimization (GradNorm)
     use_gradnorm: bool = True
-    gradnorm_alpha: float = 0.15                # Slightly higher for faster adaptation
+    gradnorm_alpha: float = 0.12
     gradnorm_update_freq: int = 5
     
     # Graph constraint scheduling
     graph_weight_schedule: str = "delayed_ramp"
-    graph_start_epoch: int = 3                  # Earlier start with faster training
-    graph_end_weight: float = 0.3
+    graph_start_epoch: int = 5
+    graph_end_weight: float = 0.25
     
     def __post_init__(self):
-        # Progressive resolution strategy
-        if self.voxel_size_stage is None:
-            self.voxel_size_stage = {
-                "stage1": 48,   # Start lower for speed
-                "stage2": 64,   # Medium resolution
-                "stage3": 96    # Full resolution
-            }
-        
-        if self.image_size_stage is None:
-            self.image_size_stage = {
-                "stage1": (192, 192),   # Start medium
-                "stage2": (256, 256),   # Increase
-                "stage3": (384, 384)    # Full resolution
-            }
-        
+        # Provide default loss schedule if not set
         if self.loss_schedule is None:
             self.loss_schedule = {
                 "segmentation": "static",
@@ -118,93 +101,86 @@ class CurriculumConfig:
                 "graph": "delayed_ramp",
             }
 
+        # Default objectives used by GradNorm / trainer monitoring
         if self.objectives is None:
             self.objectives = [
-                "segmentation", "dice", "sdf", "attributes",
-                "polygon", "voxel", "topology",
-                "latent_consistency", "graph",
+                "segmentation",
+                "dice",
+                "sdf",
+                "attributes",
+                "polygon",
+                "voxel",
+                "topology",
+                "latent_consistency",
+                "graph",
             ]
 
 
 @dataclass
 class TrainingConfig:
-    """Training configuration - Optimized for 48GB GPU throughput"""
+    """Training configuration with adaptive strategies"""
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     
-    # Reduced epoch counts due to higher batch size and faster convergence
-    max_stage1_epochs: int = 50                 # Reduced from 40
-    max_stage2_epochs: int = 30                 # Reduced from 25
-    max_stage3_epochs: int = 65                 # Reduced from 60
+    # Dynamic epoch limits (maxima; curriculum may switch earlier)
+    max_stage1_epochs: int = 40
+    max_stage2_epochs: int = 25
+    max_stage3_epochs: int = 60
     
-    min_stage1_epochs: int = 6                  # Reduced from 8
-    min_stage2_epochs: int = 4                  # Reduced from 5
-    min_stage3_epochs: int = 10                 # Reduced from 12
+    # Minimum epochs per stage (avoid switching too early)
+    min_stage1_epochs: int = 8
+    min_stage2_epochs: int = 5
+    min_stage3_epochs: int = 12
     
-    # Learning rates - Higher for larger batches (batch_size=16 vs 4)
-    # Using square root scaling: LR_new = LR_old * sqrt(batch_new/batch_old)
-    stage1_lr: float = 3e-4                     # Scaled from 3e-4 (sqrt(16/4) = 2x)
-    stage1_weight_decay: float = 5e-6           # Slightly lower with larger batch
+    # Learning rates (per stage)
+    stage1_lr: float = 3e-4  # was 3e-4
+    stage1_weight_decay: float = 1e-5
     
-    stage2_lr: float = 1e-4                     # Scaled from 1e-4
-    stage2_weight_decay: float = 5e-6
+    stage2_lr: float = 1e-4  # was 1e-4 
+    stage2_weight_decay: float = 1e-5
     
-    stage3_lr: float = 5e-4                     # Scaled from 5e-5
-    stage3_weight_decay: float = 5e-6
+    stage3_lr: float = 5e-5  # was 5e-5
+    stage3_weight_decay: float = 1e-5
     
     # Advanced training techniques
-    use_mixed_precision: bool = True            # Critical for 48GB efficiency
+    use_mixed_precision: bool = True
     use_cosine_restarts: bool = True
-    warmup_epochs: int = 3                      # Slightly longer warmup
-    grad_clip_norm: float = 1.0              # Higher for larger model
+    warmup_epochs: int = 2
+    grad_clip_norm: float = 1.0
     
-    # Gradient monitoring
+    # Gradient monitoring for dynamic weighting
     track_gradient_norms: bool = True
-    gradient_norm_window: int = 10
+    gradient_norm_window: int = 10  # rolling window for gradient tracking
     
     # Checkpointing
-    checkpoint_freq: int = 3                    # More frequent due to faster epochs
+    checkpoint_freq: int = 4
     
     # Curriculum configuration
     curriculum: CurriculumConfig = None
     
-    # Additional optimization settings
-    channels_last: bool = True                  # Memory format optimization
-    compile_model: bool = False                 # torch.compile for 2x speedup (PyTorch 2.0+)
-    tf32_matmul: bool = True                    # Enable TF32 for A100/H100 GPUs
-    cudnn_benchmark: bool = True                # Auto-tune cuDNN kernels
-    
     def __post_init__(self):
         if self.curriculum is None:
             self.curriculum = CurriculumConfig()
-        
-        # Enable performance optimizations
-        if self.tf32_matmul and torch.cuda.is_available():
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
-        
-        if self.cudnn_benchmark:
-            torch.backends.cudnn.benchmark = True
 
 
 @dataclass
 class LossConfig:
-    """Loss function weights - Adjusted for higher capacity model"""
+    """Loss function weights (will be dynamically adjusted during training)"""
     # Base weights (starting values)
     seg_weight: float = 1.0
     dice_weight: float = 1.0
-    sdf_weight: float = 0.6                     # Slightly higher (was 0.5)
+    sdf_weight: float = 0.5
     attr_weight: float = 1.0
-    polygon_weight: float = 1.2                 # Higher for better geometry (was 1.0)
-    voxel_weight: float = 1.2                   # Higher for 3D quality (was 1.0)
-    topology_weight: float = 0.15               # Start slightly higher (was 0.1)
+    polygon_weight: float = 1.0
+    voxel_weight: float = 1.0
+    topology_weight: float = 0.1  # start low, ramp up
     
     # New loss components
-    latent_consistency_weight: float = 0.6      # Higher (was 0.5)
-    graph_constraint_weight: float = 0.35       # Higher (was 0.3)
+    latent_consistency_weight: float = 0.5
+    graph_constraint_weight: float = 0.3
     
     # Dynamic weighting parameters
     enable_dynamic_weighting: bool = True
-    weight_update_freq: int = 8                 # More frequent updates (was 10)
+    weight_update_freq: int = 10
     weight_momentum: float = 0.9
 
 
@@ -216,23 +192,24 @@ class InferenceConfig:
     output_dir: str = "./outputs"
     export_intermediate: bool = True
     polygon_threshold: float = 0.5
-    batch_size: int = 8                         # Higher for faster inference
-    use_mixed_precision: bool = True            # FP16 for 2x inference speed
 
 
-# Curriculum stage transition logic (unchanged)
+# Curriculum stage transition logic
 class StageTransitionCriteria:
     """Defines criteria for automatic stage transitions"""
     
     @staticmethod
     def should_transition_from_stage1(train_losses, val_losses, config: CurriculumConfig) -> bool:
+        """Check if should transition from Stage 1 to Stage 2"""
         if len(val_losses) < config.plateau_detection_window:
             return False
             
+        # Check for plateau in segmentation + dice losses
         recent_losses = val_losses[-config.plateau_detection_window:]
         if len(recent_losses) < 2:
             return False
             
+        # Calculate improvement rate
         old_avg = sum(recent_losses[:len(recent_losses)//2]) / (len(recent_losses)//2)
         new_avg = sum(recent_losses[len(recent_losses)//2:]) / (len(recent_losses) - len(recent_losses)//2)
         
@@ -241,9 +218,11 @@ class StageTransitionCriteria:
     
     @staticmethod 
     def should_transition_from_stage2(polygon_losses, config: CurriculumConfig) -> bool:
+        """Check if should transition from Stage 2 to Stage 3"""
         if len(polygon_losses) < config.plateau_detection_window:
             return False
             
+        # Check polygon loss plateau
         recent_losses = polygon_losses[-config.plateau_detection_window:]
         if len(recent_losses) < 2:
             return False
@@ -255,29 +234,9 @@ class StageTransitionCriteria:
         return improvement_rate < config.min_improvement_threshold
 
 
-# Default configurations
+# Default configurations (import these in your trainer)
 DEFAULT_DATA_CONFIG = DataConfig()
 DEFAULT_MODEL_CONFIG = ModelConfig()
 DEFAULT_TRAINING_CONFIG = TrainingConfig()
 DEFAULT_LOSS_CONFIG = LossConfig()
 DEFAULT_INFERENCE_CONFIG = InferenceConfig()
-
-
-# Performance tuning guide printed on import
-print("=" * 80)
-print("NEURAL-GEOMETRIC 3D GENERATOR - 48GB GPU OPTIMIZED CONFIGURATION")
-print("=" * 80)
-print(f"Batch Size: {DEFAULT_DATA_CONFIG.batch_size} (4x increase)")
-print(f"Image Resolution: {DEFAULT_DATA_CONFIG.image_size} (1.5x increase)")
-print(f"Voxel Resolution: {DEFAULT_DATA_CONFIG.voxel_size} (1.5x increase)")
-print(f"Feature Dimension: {DEFAULT_MODEL_CONFIG.feature_dim} (1.5x increase)")
-print(f"Model Parameters: ~2.5x increase from base configuration")
-print(f"Expected Training Speed: ~3-4x faster per epoch")
-print(f"Expected Memory Usage: ~35-42GB / 48GB")
-print("=" * 80)
-print("Performance Tips:")
-print("  • Enable torch.compile() if using PyTorch 2.0+ for 2x speedup")
-print("  • Use channels_last memory format (enabled by default)")
-print("  • Monitor GPU utilization with nvidia-smi or wandb")
-print("  • Adjust batch_size if OOM errors occur (try 12 or 14)")
-print("=" * 80)
