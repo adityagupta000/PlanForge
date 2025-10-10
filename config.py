@@ -2,6 +2,19 @@
 Configuration settings for the Neural-Geometric 3D Model Generator
 Enhanced with dynamic curriculum and adaptive training strategies
 """
+
+# CLASS CONFIGURATION - CRITICAL
+# This model expects EXACTLY 5 classes (indices 0-4):
+#   0 = background
+#   1 = wall
+#   2 = door
+#   3 = window
+#   4 = floor
+# NOTE: Class 5 (cube artifact) is deliberately EXCLUDED
+# Dataset generation must filter class 5 before training
+# num_classes=5 means indices 0,1,2,3,4 (total 5 classes)
+
+
 from dataclasses import dataclass
 from typing import Tuple, Dict, Any, Optional, List
 import torch
@@ -22,7 +35,7 @@ class DataConfig:
 class ModelConfig:
     """Model architecture configuration optimized for high accuracy"""
     input_channels: int = 3
-    num_classes: int = 5
+    num_classes: int = 5  # Classes 0-4 (background, wall, door, window, floor) - class 5 excluded
     feature_dim: int = 512     # reduced from 768 → faster while keeping strong accuracy
     num_attributes: int = 6
     voxel_size: int = 64

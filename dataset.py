@@ -22,7 +22,7 @@ class AdvancedFloorPlanDataset(Dataset):
     - Attribute dictionary (geometric parameters)
     - Ground-truth mesh + voxelized occupancy
     - Polygon outlines for vectorization supervision
-    
+
     Enhanced with optional in-memory caching for performance
     """
 
@@ -54,16 +54,20 @@ class AdvancedFloorPlanDataset(Dataset):
         # NEW: In-memory caching for performance
         self.cache_in_memory = getattr(config, "cache_in_memory", False)
         self._cache = None
-        
+
         if self.cache_in_memory and len(self.samples) > 0:
-            print(f"[DATA] Preloading {len(self.samples)} samples into RAM (cache_in_memory=True).")
-            print("[DATA] This may take significant memory but will speed up training...")
-            
+            print(
+                f"[DATA] Preloading {len(self.samples)} samples into RAM (cache_in_memory=True)."
+            )
+            print(
+                "[DATA] This may take significant memory but will speed up training..."
+            )
+
             # Estimate memory usage
             estimated_mb = self._estimate_memory_usage()
             print(f"[DATA] Estimated memory usage: {estimated_mb:.1f} MB")
-            
-            start_time = time.time() 
+
+            start_time = time.time()
             self._preload_cache()
             load_time = time.time() - start_time
             print(f"[DATA] Cache preloading completed in {load_time:.2f}s")
@@ -72,34 +76,38 @@ class AdvancedFloorPlanDataset(Dataset):
         """Estimate memory usage for caching"""
         if not self.samples:
             return 0.0
-        
+
         H, W = self.image_size
         n_samples = len(self.samples)
-        
+
         # Rough estimates in bytes
         image_bytes = H * W * 3  # RGB uint8
-        mask_bytes = H * W  # grayscale uint8  
-        voxel_bytes = self.voxel_size ** 3 * 4  # float32
+        mask_bytes = H * W  # grayscale uint8
+        voxel_bytes = self.voxel_size**3 * 4  # float32
         json_bytes = 1024  # rough estimate for params + polygons
-        
+
         if self.voxel_size >= 128:
             voxel_gb = (voxel_bytes * n_samples) / (1024**3)
-            print(f"[WARNING] Large voxel grid ({self.voxel_size}^3) may lead to high memory usage: {voxel_gb:.2f} GB just for voxels")
-            print("[Warning] Consider reducing voxel_size or disabling cache_in_memory.")
-        
+            print(
+                f"[WARNING] Large voxel grid ({self.voxel_size}^3) may lead to high memory usage: {voxel_gb:.2f} GB just for voxels"
+            )
+            print(
+                "[Warning] Consider reducing voxel_size or disabling cache_in_memory."
+            )
+
         total_per_sample = image_bytes + mask_bytes + voxel_bytes + json_bytes
         total_mb = (total_per_sample * n_samples) / (1024 * 1024)
-        
+
         return total_mb
 
     def _preload_cache(self):
         """Preload all samples into memory"""
         self._cache = []
-        
+
         for i, sample in enumerate(self.samples):
             if i % 100 == 0:
                 print(f"[DATA] Loading sample {i+1}/{len(self.samples)}")
-                
+
             try:
                 # Load image
                 img = cv2.imread(str(sample["image"]))
@@ -108,14 +116,16 @@ class AdvancedFloorPlanDataset(Dataset):
                     continue
                 img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
                 img = cv2.resize(img, self.image_size)  # (W, H) format for cv2.resize
-                
+
                 # Load mask
                 mask = cv2.imread(str(sample["mask"]), cv2.IMREAD_GRAYSCALE)
                 if mask is None:
                     print(f"Warning: Could not load mask {sample['mask']}")
                     continue
-                mask = cv2.resize(mask, self.image_size, interpolation=cv2.INTER_NEAREST)
-                
+                mask = cv2.resize(
+                    mask, self.image_size, interpolation=cv2.INTER_NEAREST
+                )
+
                 # Load voxel data
                 try:
                     voxel_data = np.load(sample["voxel"])
@@ -123,8 +133,11 @@ class AdvancedFloorPlanDataset(Dataset):
                 except Exception as e:
                     print(f"Warning: Could not load voxel data {sample['voxel']}: {e}")
                     # Create dummy voxel data
-                    vox = np.zeros((self.voxel_size, self.voxel_size, self.voxel_size), dtype=np.float32)
-                
+                    vox = np.zeros(
+                        (self.voxel_size, self.voxel_size, self.voxel_size),
+                        dtype=np.float32,
+                    )
+
                 # Load parameters
                 try:
                     with open(sample["params"], "r") as f:
@@ -132,7 +145,7 @@ class AdvancedFloorPlanDataset(Dataset):
                 except Exception as e:
                     print(f"Warning: Could not load params {sample['params']}: {e}")
                     params = self._get_default_attributes()
-                
+
                 # Load polygons
                 try:
                     with open(sample["polygon"], "r") as f:
@@ -140,16 +153,18 @@ class AdvancedFloorPlanDataset(Dataset):
                 except Exception as e:
                     print(f"Warning: Could not load polygons {sample['polygon']}: {e}")
                     polygons = {"walls": []}
-                
-                self._cache.append({
-                    "image": img,
-                    "mask": mask,
-                    "vox": vox,
-                    "params": params,
-                    "polygons": polygons,
-                    "sample_id": sample["image"].parent.name,
-                })
-                
+
+                self._cache.append(
+                    {
+                        "image": img,
+                        "mask": mask,
+                        "vox": vox,
+                        "params": params,
+                        "polygons": polygons,
+                        "sample_id": sample["image"].parent.name,
+                    }
+                )
+
             except Exception as e:
                 print(f"Error loading sample {i}: {e}")
                 continue
@@ -202,24 +217,24 @@ class AdvancedFloorPlanDataset(Dataset):
         # Use cached data if available
         if self._cache is not None:
             cached_sample = self._cache[idx]
-            image = cached_sample['image']
-            mask = cached_sample['mask']
-            vox = cached_sample['vox']
-            attributes = cached_sample['params']
-            polygons_gt = cached_sample['polygons']
-            sample_id = cached_sample['sample_id']
+            image = cached_sample["image"]
+            mask = cached_sample["mask"]
+            vox = cached_sample["vox"]
+            attributes = cached_sample["params"]
+            polygons_gt = cached_sample["polygons"]
+            sample_id = cached_sample["sample_id"]
         else:
             # Fallback: load from disk on-the-fly
             sample = self.samples[idx]
-            
+
             # Load image and mask
             image = cv2.imread(str(sample["image"]))
             image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             image = cv2.resize(image, self.image_size)
-            
+
             mask = cv2.imread(str(sample["mask"]), cv2.IMREAD_GRAYSCALE)
             mask = cv2.resize(mask, self.image_size, interpolation=cv2.INTER_NEAREST)
-            
+
             # Load attributes
             with open(sample["params"], "r") as f:
                 attributes = json.load(f)
@@ -231,16 +246,99 @@ class AdvancedFloorPlanDataset(Dataset):
             # Load polygon ground truth
             with open(sample["polygon"], "r") as f:
                 polygons_gt = json.load(f)
-            
+
             sample_id = sample["image"].parent.name
 
         # Normalize image to [0,1]
         image = image.astype(np.float32) / 255.0
-        
+
         # Clean mask (remove class 5 if present)
-        if np.any(mask == 5):
-            print(f"WARNING: Found class 5 in sample {idx}. Verify this class should be removed!")
-        mask[mask == 5] = 0    
+        # CRITICAL: Validate and clean mask - ONLY CLASSES 0-4 ALLOWED
+        # Class 5 (cube) should have been filtered during dataset generation
+        valid_classes = set(range(5))  # {0, 1, 2, 3, 4}
+        mask_classes = set(np.unique(mask).tolist())
+        invalid_classes = mask_classes - valid_classes
+
+        if invalid_classes:
+            print(
+                f"ERROR: Sample {idx} ({sample_id}) contains INVALID classes {invalid_classes}"
+            )
+            print(
+                f"  Expected only classes 0-4 (background, wall, door, window, floor)"
+            )
+            print(
+                f"  This indicates dataset generation failed to filter class 5 (cube)"
+            )
+            print(f"  Forcing cleanup: remapping {invalid_classes} -> 0 (background)")
+
+            # Force remap invalid classes to background
+            for invalid_class in invalid_classes:
+                mask[mask == invalid_class] = 0
+
+            # Log for debugging
+            self.stats.errors.append(
+                {
+                    "sample_id": sample_id,
+                    "error": f"Invalid classes {invalid_classes} found and remapped",
+                }
+            )
+
+        # Additional validation: warn if mask is empty
+        non_bg_pixels = np.sum(mask > 0)
+        if non_bg_pixels == 0:
+            print(
+                f"WARNING: Sample {idx} ({sample_id}) has EMPTY mask (all background)"
+            )
+
+        # VALIDATION: Verify parameter ranges match dataset generation expectations
+        attr_array = attr_tensor.numpy()
+
+        # Expected values after normalization (from config.py architectural params):
+        # wall_height: 2.6m / 5.0 = 0.52
+        # wall_thickness: 0.15m / 0.5 = 0.3
+        # window_base_height: 0.7m / 3.0 = 0.233
+        # window_height: 0.95m / 2.0 = 0.475
+        # door_height: 2.6m / 5.0 = 0.52
+        # pixel_scale: 0.01 / 0.02 = 0.5
+
+        validation_failed = False
+
+        # Check wall_height (normalized): should be ~0.52 (range 0.4-0.7)
+        if not (0.4 <= attr_array[0] <= 0.7):
+            print(
+                f"WARNING: Sample {idx} wall_height normalized = {attr_array[0]:.3f} (expected ~0.52)"
+            )
+            validation_failed = True
+
+        # Check wall_thickness (normalized): should be ~0.3 (range 0.2-0.5)
+        if not (0.2 <= attr_array[1] <= 0.5):
+            print(
+                f"WARNING: Sample {idx} wall_thickness normalized = {attr_array[1]:.3f} (expected ~0.3)"
+            )
+            validation_failed = True
+
+        # Check window_base_height (normalized): should be ~0.233 (range 0.15-0.35)
+        if not (0.15 <= attr_array[2] <= 0.35):
+            print(
+                f"WARNING: Sample {idx} window_base_height normalized = {attr_array[2]:.3f} (expected ~0.233)"
+            )
+            validation_failed = True
+
+        # Check window_height (normalized): should be ~0.475 (range 0.35-0.65)
+        if not (0.35 <= attr_array[3] <= 0.65):
+            print(
+                f"WARNING: Sample {idx} window_height normalized = {attr_array[3]:.3f} (expected ~0.475)"
+            )
+            validation_failed = True
+
+        if validation_failed:
+            print(
+                f"  Sample {idx} ({sample_id}): Architectural parameters outside expected ranges"
+            )
+            print(
+                f"  This indicates dataset was generated with incorrect config.py values"
+            )
+            print(f"  Raw attributes: {attributes}")
 
         # Convert to tensors
         image_tensor = torch.from_numpy(image).float().permute(2, 0, 1)
@@ -255,7 +353,9 @@ class AdvancedFloorPlanDataset(Dataset):
             image_tensor, mask_tensor = self._augment(image_tensor, mask_tensor)
 
         # Add validation before returning
-        self._validate_sample_data(idx, image_tensor, mask_tensor, attr_tensor, voxels_tensor, polygon_tensor)
+        self._validate_sample_data(
+            idx, image_tensor, mask_tensor, attr_tensor, voxels_tensor, polygon_tensor
+        )
 
         return {
             "image": image_tensor,
@@ -271,14 +371,14 @@ class AdvancedFloorPlanDataset(Dataset):
         """Validate sample data for NaN/Inf values"""
         tensors_to_check = [
             ("image", image),
-            ("mask", mask), 
+            ("mask", mask),
             ("attributes", attributes),
             ("voxels", voxels),
-            ("polygons", polygons["polygons"])
+            ("polygons", polygons["polygons"]),
         ]
-        
+
         corrupted_data = False
-        
+
         for name, tensor in tensors_to_check:
             if torch.isnan(tensor).any():
                 print(f"ERROR: {name} contains NaN values at sample {idx}")
@@ -286,10 +386,12 @@ class AdvancedFloorPlanDataset(Dataset):
             if torch.isinf(tensor).any():
                 print(f"ERROR: {name} contains Inf values at sample {idx}")
                 corrupted_data = True
-        
+
         if corrupted_data:
-            print(f"WARNING: Corrupted data detected in sample {idx}, replacing with safe fallback values")
-            
+            print(
+                f"WARNING: Corrupted data detected in sample {idx}, replacing with safe fallback values"
+            )
+
             # Replace corrupted tensors with safe fallback values
             for name, tensor in tensors_to_check:
                 if torch.isnan(tensor).any() or torch.isinf(tensor).any():
@@ -307,7 +409,9 @@ class AdvancedFloorPlanDataset(Dataset):
                         voxels.data = torch.zeros_like(voxels)
                     elif name == "polygons":
                         # Replace polygons with zeros
-                        polygons["polygons"].data = torch.zeros_like(polygons["polygons"])
+                        polygons["polygons"].data = torch.zeros_like(
+                            polygons["polygons"]
+                        )
 
     # ----------------------------------------------------------------------
     def _process_attributes(self, attributes):
@@ -321,7 +425,7 @@ class AdvancedFloorPlanDataset(Dataset):
             attributes.get("door_height", 2.6) / 5.0,
             attributes.get("pixel_scale", 0.01) / 0.02,
         ]
-        
+
         # Ensure no NaN/Inf values in attribute processing
         safe_attr_list = []
         for val in attr_list:
@@ -329,7 +433,7 @@ class AdvancedFloorPlanDataset(Dataset):
                 safe_attr_list.append(0.5)  # Default normalized value
             else:
                 safe_attr_list.append(max(0.0, min(1.0, val)))  # Clamp to [0,1]
-        
+
         return torch.tensor(safe_attr_list, dtype=torch.float32)
 
     # ----------------------------------------------------------------------
@@ -339,8 +443,8 @@ class AdvancedFloorPlanDataset(Dataset):
         1. Nested dict: { "walls": [...], "doors": [...], ... }
         2. Flat list:   [ {"type": "wall", "points": [...]}, ... ]
         """
-        max_polygons = 30   # number of polygons per sample
-        max_points = 100     # max points per polygon
+        max_polygons = 30  # number of polygons per sample
+        max_points = 100  # max points per polygon
 
         processed = torch.zeros(max_polygons, max_points, 2)
         valid_mask = torch.zeros(max_polygons, dtype=torch.bool)
@@ -362,20 +466,26 @@ class AdvancedFloorPlanDataset(Dataset):
                         points = np.array(polygon["points"])
                         if len(points) > max_points:
                             # Subsample evenly if too many points
-                            indices = np.linspace(0, len(points) - 1, max_points, dtype=int)
+                            indices = np.linspace(
+                                0, len(points) - 1, max_points, dtype=int
+                            )
                             points = points[indices]
 
                         # Check for NaN/Inf in points
                         if np.any(np.isnan(points)) or np.any(np.isinf(points)):
-                            print(f"Warning: Invalid polygon points detected, skipping polygon")
+                            print(
+                                f"Warning: Invalid polygon points detected, skipping polygon"
+                            )
                             continue
 
                         # Normalize to [0,1] relative to image size
                         points = points / np.array(self.image_size)
                         # Clamp to valid range
                         points = np.clip(points, 0.0, 1.0)
-                        
-                        processed[poly_idx, : len(points)] = torch.from_numpy(points).float()
+
+                        processed[poly_idx, : len(points)] = torch.from_numpy(
+                            points
+                        ).float()
                         valid_mask[poly_idx] = True
                         poly_idx += 1
 
@@ -394,13 +504,17 @@ class AdvancedFloorPlanDataset(Dataset):
 
                     # Check for NaN/Inf in points
                     if np.any(np.isnan(points)) or np.any(np.isinf(points)):
-                        print(f"Warning: Invalid polygon points detected, skipping polygon")
+                        print(
+                            f"Warning: Invalid polygon points detected, skipping polygon"
+                        )
                         continue
 
                     points = points / np.array(self.image_size)
                     points = np.clip(points, 0.0, 1.0)
-                    
-                    processed[poly_idx, : len(points)] = torch.from_numpy(points).float()
+
+                    processed[poly_idx, : len(points)] = torch.from_numpy(
+                        points
+                    ).float()
                     valid_mask[poly_idx] = True
                     poly_idx += 1
 
@@ -434,16 +548,21 @@ class AdvancedFloorPlanDataset(Dataset):
         # Slight brightness/contrast adjustment with safety checks
         if torch.rand(1) < 0.3:
             brightness = torch.rand(1) * 0.2 - 0.1  # ±0.1
-            contrast = torch.rand(1) * 0.2 + 0.9     # 0.9-1.1
+            contrast = torch.rand(1) * 0.2 + 0.9  # 0.9-1.1
             image = torch.clamp(image * contrast + brightness, 0, 1)
-            
+
             # Additional safety check for augmented image
             if torch.isnan(image).any() or torch.isinf(image).any():
-                print("Warning: Augmentation produced invalid values, reverting to original")
+                print(
+                    "Warning: Augmentation produced invalid values, reverting to original"
+                )
                 # Revert to safe values
                 image = torch.clamp(image, 0, 1)
-                image = torch.where(torch.isnan(image) | torch.isinf(image), 
-                                  torch.zeros_like(image), image)
+                image = torch.where(
+                    torch.isnan(image) | torch.isinf(image),
+                    torch.zeros_like(image),
+                    image,
+                )
 
         return image, mask
 
@@ -455,13 +574,17 @@ class AdvancedFloorPlanDataset(Dataset):
             "cache_loaded": self._cache is not None,
             "cached_samples": len(self._cache) if self._cache else 0,
             "total_samples": len(self.samples),
-            "estimated_memory_mb": self._estimate_memory_usage() if self.cache_in_memory else 0
+            "estimated_memory_mb": (
+                self._estimate_memory_usage() if self.cache_in_memory else 0
+            ),
         }
 
     def disable_cache(self):
         """Disable caching and free memory"""
         if self._cache is not None:
-            print(f"[DATA] Disabling cache and freeing memory for {len(self._cache)} samples")
+            print(
+                f"[DATA] Disabling cache and freeing memory for {len(self._cache)} samples"
+            )
             self._cache = None
             self.cache_in_memory = False
 
@@ -514,34 +637,36 @@ class SyntheticFloorPlanDataset(Dataset):
     """
     Synthetic dataset for testing and development when real data is not available
     """
-    
+
     def __init__(self, num_samples=1000, image_size=(256, 256), voxel_size=64):
         self.num_samples = num_samples
         self.image_size = image_size
         self.voxel_size = voxel_size
-    
+
     def __len__(self):
         return self.num_samples
-    
+
     def __getitem__(self, idx):
         # Generate deterministic synthetic data based on index
         np.random.seed(idx)
         torch.manual_seed(idx)
-        
+
         image, mask, attributes, voxels, polygons_gt = create_synthetic_data_sample()
-        
+
         # Convert to tensors
-        image_tensor = torch.from_numpy(image.astype(np.float32) / 255.0).permute(2, 0, 1)
+        image_tensor = torch.from_numpy(image.astype(np.float32) / 255.0).permute(
+            2, 0, 1
+        )
         mask_tensor = torch.from_numpy(mask).long()
         voxels_tensor = torch.from_numpy(voxels.astype(np.float32))
-        
+
         # Process attributes and polygons using same methods as main dataset
         dataset = AdvancedFloorPlanDataset.__new__(AdvancedFloorPlanDataset)
         dataset.image_size = self.image_size
-        
+
         attr_tensor = dataset._process_attributes(attributes)
         polygon_tensor = dataset._process_polygons(polygons_gt)
-        
+
         return {
             "image": image_tensor,
             "mask": mask_tensor,
