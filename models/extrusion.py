@@ -21,7 +21,7 @@ if not logger.handlers:
 logger.setLevel(logging.INFO)
 
 
-def _sanitize_normalized_height(value, sample_id=None, default=0.6):
+def _sanitize_normalized_height(value, sample_id=None, default=0.5):
     """
     Ensure normalized height value is finite and in [0,1].
     Returns a float in [0,1].
@@ -186,11 +186,11 @@ class DifferentiableExtrusion(nn.Module):
             # Sanitize height with logging
             wall_height_normalized = attributes[b, 0]
             sanitized_norm = _sanitize_normalized_height(
-                wall_height_normalized, sample_id=sid, default=0.6
+                wall_height_normalized, sample_id=sid, default=0.5
             )
 
-            wall_height_m = sanitized_norm * 5.0
-            height_frac = wall_height_m / 5.0
+            wall_height_m = sanitized_norm * 2.0
+            height_frac = wall_height_m / 2.0
             height_voxels = int(round(height_frac * D))
             height_voxels = max(1, min(D, height_voxels))
 
@@ -366,9 +366,9 @@ class DifferentiableExtrusionFast(nn.Module):
 
             # Sanitize height
             wall_height_normalized = attributes[b, 0]
-            sanitized_norm = _sanitize_normalized_height(wall_height_normalized, sample_id=b, default=0.6)
-            wall_height_m = sanitized_norm * 5.0
-            height_frac = wall_height_m / 5.0
+            sanitized_norm = _sanitize_normalized_height(wall_height_normalized, sample_id=b, default=0.5)
+            wall_height_m = sanitized_norm * 2.0
+            height_frac = wall_height_m / 2.0
             height_voxels = int(round(height_frac * D))
             height_voxels = max(1, min(D, height_voxels))
 

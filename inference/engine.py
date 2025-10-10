@@ -22,7 +22,7 @@ class ResearchInferenceEngine:
     def __init__(self, model_path=None, device="cuda", config=None):
         if config is None:
             config = DEFAULT_INFERENCE_CONFIG
-            
+
         self.device = device
         self.config = config
         self.model = NeuralGeometric3DGenerator()
@@ -37,10 +37,7 @@ class ResearchInferenceEngine:
         print(f"Loaded trained model from {model_path}")
 
     def generate_3d_model(
-        self, 
-        image_path: str, 
-        output_path: str, 
-        export_intermediate: bool = None
+        self, image_path: str, output_path: str, export_intermediate: bool = None
     ):
         """
         Complete pipeline: Image -> Segmentation -> Polygons -> 3D Model
@@ -87,7 +84,7 @@ class ResearchInferenceEngine:
         image = cv2.imread(image_path)
         if image is None:
             raise ValueError(f"Could not load image from {image_path}")
-            
+
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         image = cv2.resize(image, (256, 256))
         image = torch.from_numpy(image / 255.0).float()
@@ -106,12 +103,12 @@ class ResearchInferenceEngine:
 
         # Denormalize (reverse of normalization in dataset)
         attributes_dict = {
-            "wall_height": float(attr_np[0] * 5.0),
-            "wall_thickness": float(attr_np[1] * 0.5),
-            "window_base_height": float(attr_np[2] * 3.0),
-            "window_height": float(attr_np[3] * 2.0),
-            "door_height": float(attr_np[4] * 5.0),
-            "pixel_scale": float(attr_np[5] * 0.02),
+            "wall_height": float(attr_np[0] * 2.0),  # Changed: multiply by 2.0
+            "wall_thickness": float(attr_np[1] * 0.5),  # Unchanged
+            "window_base_height": float(attr_np[2] * 0.5),  # Changed: multiply by 0.5
+            "window_height": float(attr_np[3] * 0.5),  # Changed: multiply by 0.5
+            "door_height": float(attr_np[4] * 2.0),  # Changed: multiply by 2.0
+            "pixel_scale": float(attr_np[5] * 0.02),  # Unchanged
         }
 
         return attributes_dict
@@ -179,7 +176,7 @@ class ResearchInferenceEngine:
             vertex_count = 0
 
             # Extract geometric parameters
-            wall_height = attributes.get("wall_height", 2.6)
+            wall_height = attributes.get("wall_height", 1.0)
             wall_thickness = attributes.get("wall_thickness", 0.15)
             pixel_scale = attributes.get("pixel_scale", 0.01)
 
@@ -418,38 +415,42 @@ class ResearchInferenceEngine:
         """Process multiple images in batch"""
         output_dir = Path(output_dir)
         output_dir.mkdir(exist_ok=True)
-        
+
         results = []
-        
+
         for img_path in image_paths:
             img_path = Path(img_path)
             print(f"Processing: {img_path.name}")
-            
+
             output_path = output_dir / f"{img_path.stem}_model.obj"
-            
+
             try:
                 success = self.generate_3d_model(
                     str(img_path), str(output_path), export_intermediate=True
                 )
-                
-                results.append({
-                    "input": str(img_path),
-                    "output": str(output_path),
-                    "success": success
-                })
-                
+
+                results.append(
+                    {
+                        "input": str(img_path),
+                        "output": str(output_path),
+                        "success": success,
+                    }
+                )
+
                 if success:
                     print(f"✓ Generated: {output_path}")
                 else:
                     print(f"✗ Failed: {img_path.name}")
-                    
+
             except Exception as e:
                 print(f"✗ Error processing {img_path.name}: {str(e)}")
-                results.append({
-                    "input": str(img_path),
-                    "output": str(output_path),
-                    "success": False,
-                    "error": str(e)
-                })
-        
+                results.append(
+                    {
+                        "input": str(img_path),
+                        "output": str(output_path),
+                        "success": False,
+                        "error": str(e),
+                    }
+                )
+
         return results

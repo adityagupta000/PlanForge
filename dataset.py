@@ -172,12 +172,12 @@ class AdvancedFloorPlanDataset(Dataset):
     def _get_default_attributes(self):
         """Return default attributes for missing param files"""
         return {
-            "wall_height": 2.6,
-            "wall_thickness": 0.15,
-            "window_base_height": 0.7,
-            "window_height": 0.95,
-            "door_height": 2.6,
-            "pixel_scale": 0.02,
+            "wall_height": 1.0,  # Changed to match dataset
+            "wall_thickness": 0.15,  # Unchanged
+            "window_base_height": 0.269,  # Changed to match dataset
+            "window_height": 0.365,  # Changed to match dataset
+            "door_height": 1.0,  # Changed to match dataset
+            "pixel_scale": 0.01,
         }
 
     # ----------------------------------------------------------------------
@@ -293,20 +293,12 @@ class AdvancedFloorPlanDataset(Dataset):
         # VALIDATION: Verify parameter ranges match dataset generation expectations
         attr_array = attr_tensor.numpy()
 
-        # Expected values after normalization (from config.py architectural params):
-        # wall_height: 2.6m / 5.0 = 0.52
-        # wall_thickness: 0.15m / 0.5 = 0.3
-        # window_base_height: 0.7m / 3.0 = 0.233
-        # window_height: 0.95m / 2.0 = 0.475
-        # door_height: 2.6m / 5.0 = 0.52
-        # pixel_scale: 0.01 / 0.02 = 0.5
-
         validation_failed = False
 
         # Check wall_height (normalized): should be ~0.52 (range 0.4-0.7)
-        if not (0.4 <= attr_array[0] <= 0.7):
+        if not (0.3 <= attr_array[0] <= 0.7):
             print(
-                f"WARNING: Sample {idx} wall_height normalized = {attr_array[0]:.3f} (expected ~0.52)"
+                f"WARNING: Sample {idx} wall_height normalized = {attr_array[0]:.3f} (expected ~0.5)"
             )
             validation_failed = True
 
@@ -318,16 +310,16 @@ class AdvancedFloorPlanDataset(Dataset):
             validation_failed = True
 
         # Check window_base_height (normalized): should be ~0.233 (range 0.15-0.35)
-        if not (0.15 <= attr_array[2] <= 0.35):
+        if not (0.4 <= attr_array[2] <= 0.7):
             print(
-                f"WARNING: Sample {idx} window_base_height normalized = {attr_array[2]:.3f} (expected ~0.233)"
+                f"WARNING: Sample {idx} window_base_height normalized = {attr_array[2]:.3f} (expected ~0.538)"
             )
             validation_failed = True
 
         # Check window_height (normalized): should be ~0.475 (range 0.35-0.65)
-        if not (0.35 <= attr_array[3] <= 0.65):
+        if not (0.6 <= attr_array[3] <= 0.9):
             print(
-                f"WARNING: Sample {idx} window_height normalized = {attr_array[3]:.3f} (expected ~0.475)"
+                f"WARNING: Sample {idx} window_height normalized = {attr_array[3]:.3f} (expected ~0.73)"
             )
             validation_failed = True
 
@@ -418,12 +410,16 @@ class AdvancedFloorPlanDataset(Dataset):
         """Convert attribute dictionary to a normalized tensor."""
         # Normalize common architectural parameters into [0,1]
         attr_list = [
-            attributes.get("wall_height", 2.6) / 5.0,
-            attributes.get("wall_thickness", 0.15) / 0.5,
-            attributes.get("window_base_height", 0.7) / 3.0,
-            attributes.get("window_height", 0.95) / 2.0,
-            attributes.get("door_height", 2.6) / 5.0,
-            attributes.get("pixel_scale", 0.01) / 0.02,
+            attributes.get("wall_height", 1.0)
+            / 2.0,  # Changed: 1.0m wall, normalize by 2.0
+            attributes.get("wall_thickness", 0.15) / 0.5,  # Unchanged
+            attributes.get("window_base_height", 0.269)
+            / 0.5,  # Changed: 0.269m, normalize by 0.5
+            attributes.get("window_height", 0.365)
+            / 0.5,  # Changed: 0.365m, normalize by 0.5
+            attributes.get("door_height", 1.0)
+            / 2.0,  # Changed: 1.0m door, normalize by 2.0
+            attributes.get("pixel_scale", 0.01) / 0.02,  # Unchanged
         ]
 
         # Ensure no NaN/Inf values in attribute processing
@@ -615,12 +611,12 @@ def create_synthetic_data_sample():
 
     # Attributes
     attributes = {
-        "wall_height": 2.6,
+        "wall_height": 1.0,
         "wall_thickness": 0.15,
-        "window_base_height": 0.7,
-        "window_height": 0.95,
-        "door_height": 2.6,
-        "pixel_scale": 0.02,
+        "window_base_height": 0.269,
+        "window_height": 0.365,
+        "door_height": 1.0,
+        "pixel_scale": 0.01,
     }
 
     # Simple voxel GT
