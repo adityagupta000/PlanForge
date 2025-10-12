@@ -135,9 +135,9 @@ class TrainingConfig:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     
     # Dynamic epoch limits (maxima; curriculum may switch earlier)
-    max_stage1_epochs: int = 40
-    max_stage2_epochs: int = 25
-    max_stage3_epochs: int = 60
+    max_stage1_epochs: int = 50
+    max_stage2_epochs: int = 55
+    max_stage3_epochs: int = 70
     
     # Minimum epochs per stage (avoid switching too early)
     min_stage1_epochs: int = 8

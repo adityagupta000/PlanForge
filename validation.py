@@ -1,6 +1,7 @@
 """
 Dataset Validation Script - STRICT CLASS 0-4 VALIDATION
 Run this BEFORE training to verify dataset only contains classes 0-4
+Updated for 1.0m wall height and 32 voxel height
 Usage: python validation.py
 """
 
@@ -93,13 +94,16 @@ def validate_sample(sample_dir: Path) -> Tuple[bool, List[str], List[str]]:
             if 5 not in excluded:
                 warnings.append(f"Class 5 not in excluded_classes list: {excluded}")
         
-        # Validate architectural parameters
+        # ============================================
+        # UPDATED: Validate architectural parameters
+        # NOW expecting 1.0m wall height (was 2.6m)
+        # ============================================
         expected_params = {
-            "wall_height": (2.0, 3.5, 2.6),      # (min, max, expected)
+            "wall_height": (0.5, 1.5, 1.0),           # NOW: 1.0m (was 2.6m)
             "wall_thickness": (0.10, 0.30, 0.15),
-            "window_base_height": (0.3, 1.5, 0.7),
-            "window_height": (0.5, 1.5, 0.95),
-            "door_height": (2.0, 3.5, 2.6),
+            "window_base_height": (0.2, 0.5, 0.269),  # NOW: 0.269m (was ~0.7m)
+            "window_height": (0.2, 0.5, 0.365),       # NOW: 0.365m (was ~0.95m)
+            "door_height": (0.5, 1.5, 1.0),           # NOW: 1.0m (was 2.6m)
             "pixel_scale": (0.005, 0.02, 0.01)
         }
         
@@ -135,12 +139,21 @@ def validate_sample(sample_dir: Path) -> Tuple[bool, List[str], List[str]]:
         if voxels.sum() == 0:
             warnings.append("Voxel grid is completely empty")
         
-        # Check voxel height distribution (should be ~33 voxels high for walls with 2.6m height)
+        # ============================================
+        # UPDATED: Check voxel height distribution
+        # NOW expecting ~32 voxels (was ~13)
+        # Formula: (1.0m / 2.0) * 64 = 32 voxels
+        # ============================================
         occupied_z = np.any(voxels > 0, axis=(1, 2))
         max_occupied_z = np.where(occupied_z)[0].max() if occupied_z.any() else 0
         
-        expected_height_voxels = int(round((2.6 / 5.0) * 64))  # ~33
-        if abs(max_occupied_z - expected_height_voxels) > 10:
+        # NEW CORRECT CALCULATION: matches training code extrusion formula
+        # wall_height_m = 1.0
+        # height_frac = 1.0 / 2.0 = 0.5
+        # wall_height_voxels = 0.5 * 64 = 32
+        expected_height_voxels = int(round((1.0 / 2.0) * 64))  # = 32
+        
+        if abs(max_occupied_z - expected_height_voxels) > 5:  # Allow ±5 voxel tolerance
             warnings.append(
                 f"Voxel height ({max_occupied_z}) differs from expected (~{expected_height_voxels})"
             )
@@ -199,7 +212,7 @@ def validate_dataset(data_dir: Path) -> Dict:
 def print_validation_report(results: Dict):
     """Print detailed validation report"""
     print("\n" + "="*80)
-    print("DATASET VALIDATION REPORT - CLASS 0-4 STRICT VALIDATION")
+    print("DATASET VALIDATION REPORT - CLASS 0-4 STRICT VALIDATION (1.0m wall)")
     print("="*80)
     
     total_valid = 0
@@ -266,6 +279,8 @@ def print_validation_report(results: Dict):
         print("✅ ALL SAMPLES VALID - Dataset ready for training!")
         print("   ✓ Only classes 0-4 present")
         print("   ✓ Class 5 (cube) successfully filtered")
+        print("   ✓ Wall height: 1.0m (scaled model)")
+        print("   ✓ Voxel height: ~32 voxels (matches training expectations)")
         print("   ✓ Architectural parameters in valid ranges")
         return True
     else:
@@ -283,10 +298,13 @@ if __name__ == "__main__":
     
     print("="*80)
     print("DATASET VALIDATION - CLASS 5 (CUBE) EXCLUSION CHECK")
+    print("Updated for 1.0m wall height and 32 voxel height")
     print("="*80)
     print(f"Dataset directory: {data_dir}")
     print(f"Valid classes: {sorted(VALID_CLASSES)}")
     print(f"Invalid classes (must be excluded): {sorted(INVALID_CLASSES)}")
+    print(f"Expected wall height: 1.0m")
+    print(f"Expected voxel height: ~32 voxels")
     print()
     
     # Run validation

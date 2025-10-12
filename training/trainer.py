@@ -8,7 +8,7 @@ import torch
 import torch.nn.utils
 
 # training/trainer.py - Fixed AMP imports
-from torch.amp import autocast, GradScaler
+from torch.cuda.amp import autocast, GradScaler
 import time
 import numpy as np
 import random
@@ -130,7 +130,7 @@ class AdaptiveMultiStageTrainer:
 
         # Add AMP and optimization settings - Updated for new PyTorch API
         self.use_amp = getattr(config, "use_mixed_precision", True)
-        self.scaler = GradScaler("cuda", enabled=self.use_amp)
+        self.scaler = GradScaler(enabled=self.use_amp)
         self.accumulation_steps = getattr(config, "accumulation_steps", 1)
         self.dvx_step_freq = getattr(config, "dvx_step_freq", 1)
         self.voxel_size_stage = getattr(config, "voxel_size_stage", None)
