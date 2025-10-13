@@ -1,5 +1,5 @@
 """
-Configuration settings for the Neural-Geometric 3D Model Generator
+Configuration settings for the 3D Model Generator
 Enhanced with dynamic curriculum and adaptive training strategies
 """
 

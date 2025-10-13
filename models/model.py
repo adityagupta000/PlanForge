@@ -169,7 +169,7 @@ class GraphStructureHead(nn.Module):
 
 class NeuralGeometric3DGenerator(nn.Module):
     """
-    Enhanced neural-geometric system with auxiliary heads for novel training strategies:
+    Enhanced 3D system with auxiliary heads for novel training strategies:
     - Cross-modal latent consistency
     - Graph structure prediction
     - Multi-view embeddings for dynamic curriculum

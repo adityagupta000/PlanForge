@@ -1,5 +1,5 @@
 """
-Demo script for the Neural-Geometric 3D Model Generator
+Demo script for the 3D Model Generator
 """
 
 import torch
@@ -14,7 +14,7 @@ from utils.visualization import visualize_predictions, create_model_summary_repo
 
 def demo_pipeline():
     """Demonstrate the complete pipeline with synthetic data"""
-    print("Neural-Geometric 3D Model Generator Demo")
+    print("3D Model Generator Demo")
     print("=" * 50)
 
     # Create output directory
@@ -132,7 +132,7 @@ def demo_with_pretrained(model_path, input_image_path=None):
 if __name__ == "__main__":
     import argparse
     
-    parser = argparse.ArgumentParser(description="Demo Neural-Geometric 3D Model Generator")
+    parser = argparse.ArgumentParser(description="Demo 3D Model Generator")
     parser.add_argument("--model_path", type=str, default=None,
                        help="Path to pretrained model (optional)")
     parser.add_argument("--input_image", type=str, default=None,

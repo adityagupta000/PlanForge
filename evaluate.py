@@ -1,6 +1,6 @@
 """
 evaluate.py
-Comprehensive evaluation CLI for Neural-Geometric 3D Model Generator.
+Comprehensive evaluation CLI for 3D Model Generator.
 
 Usage examples:
   python evaluate.py --model_path checkpoints/final_model.pth --data_dir ./data/floorplans
@@ -150,7 +150,7 @@ def run_visualization_and_exports(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate Neural-Geometric 3D model")
+    parser = argparse.ArgumentParser(description="Evaluate 3D model")
     parser.add_argument("--model_path", "-m", required=True, help="Path to model checkpoint (checkpoint.pth)")
     parser.add_argument("--data_dir", "-d", default="./data/floorplans", help="Dataset root with train/val/test")
     parser.add_argument("--device", default=None, help="Device to use (cuda or cpu). Auto-detect if omitted")

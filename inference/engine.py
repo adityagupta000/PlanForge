@@ -48,7 +48,7 @@ class ResearchInferenceEngine:
         image = self._load_image(image_path)
 
         with torch.no_grad():
-            # Neural network inference
+
             predictions = self.model(image)
 
             # Extract predictions
@@ -56,8 +56,6 @@ class ResearchInferenceEngine:
             attributes = predictions["attributes"]
             polygons = predictions["polygons"]
             validity = predictions["polygon_validity"]
-
-            print("Neural network inference complete")
 
             # Convert to deterministic representations
             mask_np = self._extract_mask(segmentation)

@@ -441,7 +441,7 @@ def compute_polygon_area(points):
 def create_model_summary_report(model, sample_input, save_path="model_summary.txt"):
     """Create detailed model summary report"""
     with open(save_path, "w") as f:
-        f.write("Neural-Geometric 3D Model Generator - Model Summary\n")
+        f.write("3D Model Summary\n")
         f.write("=" * 60 + "\n\n")
         
         # Model architecture

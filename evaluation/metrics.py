@@ -1,5 +1,5 @@
 """
-Evaluation metrics and utilities for the Neural-Geometric 3D Model Generator
+Evaluation metrics and utilities for the 3D Model Generator
 """
 
 import torch

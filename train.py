@@ -1,5 +1,5 @@
 """
-Enhanced training script for the Neural-Geometric 3D Model Generator
+Enhanced training script for the 3D Model Generator
 Implements novel training strategies: dynamic curriculum, adaptive weighting, cross-modal consistency
 """
 
@@ -206,7 +206,7 @@ def save_training_summary(history, config, output_dir):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Enhanced Neural-Geometric 3D Model Generator Training")
+    parser = argparse.ArgumentParser(description="3D Model Training")
     
     # Basic arguments
     parser.add_argument("--data_dir", type=str, default="./data/floorplans", 
@@ -292,7 +292,7 @@ def main():
     config = create_enhanced_config(args)
     
     print("\n" + "="*80)
-    print("NEURAL-GEOMETRIC 3D MODEL GENERATOR - ENHANCED TRAINING")
+    print(" 3D MODEL TRAINING")
     print("="*80)
     print("Novel Training Strategies Enabled:")
     if config.curriculum.use_dynamic_curriculum:

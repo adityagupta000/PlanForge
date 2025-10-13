@@ -1,5 +1,5 @@
 """
-Setup script for the Neural-Geometric 3D Model Generator project
+Setup script for the 3D Model Generator project
 """
 
 from pathlib import Path
@@ -42,7 +42,7 @@ def create_project_structure():
     
     init_content = {
         "models/__init__.py": '''"""
-Model components for Neural-Geometric 3D Model Generator
+Model components for 3D Model Generator
 """
 
 from .encoder import MultiScaleEncoder, ResidualBlock
@@ -63,7 +63,7 @@ __all__ = [
 ]''',
         
         "training/__init__.py": '''"""
-Training components for Neural-Geometric 3D Model Generator
+Training components for 3D Model Generator
 """
 
 from .losses import ResearchGradeLoss
@@ -75,7 +75,7 @@ __all__ = [
 ]''',
         
         "inference/__init__.py": '''"""
-Inference components for Neural-Geometric 3D Model Generator
+Inference components for 3D Model Generator
 """
 
 from .engine import ResearchInferenceEngine
@@ -85,7 +85,7 @@ __all__ = [
 ]''',
         
         "evaluation/__init__.py": '''"""
-Evaluation components for Neural-Geometric 3D Model Generator
+Evaluation components for 3D Model Generator
 """
 
 from .metrics import ModelEvaluator, evaluate_model, compute_iou, compute_3d_iou
@@ -98,7 +98,7 @@ __all__ = [
 ]''',
         
         "utils/__init__.py": '''"""
-Utility functions for Neural-Geometric 3D Model Generator
+Utility functions for 3D Model Generator
 """
 
 from .visualization import (
@@ -247,7 +247,7 @@ venv/
 
 def main():
     """Main setup function"""
-    print("Setting up Neural-Geometric 3D Model Generator project...")
+    print("Setting up 3D Model Generator project...")
     print("=" * 60)
     
     # Create directory structure
