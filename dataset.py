@@ -1,6 +1,7 @@
 """
 Dataset classes for the Neural-Geometric 3D Model Generator
 Enhanced with in-memory caching for faster training
+FIXED: UnboundLocalError in __getitem__ method
 """
 
 import cv2
@@ -275,14 +276,6 @@ class AdvancedFloorPlanDataset(Dataset):
             for invalid_class in invalid_classes:
                 mask[mask == invalid_class] = 0
 
-            # Log for debugging
-            self.stats.errors.append(
-                {
-                    "sample_id": sample_id,
-                    "error": f"Invalid classes {invalid_classes} found and remapped",
-                }
-            )
-
         # Additional validation: warn if mask is empty
         non_bg_pixels = np.sum(mask > 0)
         if non_bg_pixels == 0:
@@ -290,7 +283,17 @@ class AdvancedFloorPlanDataset(Dataset):
                 f"WARNING: Sample {idx} ({sample_id}) has EMPTY mask (all background)"
             )
 
+        # Convert to tensors FIRST (before validation that uses attr_tensor)
+        # FIX: This was moved here from later in the function
+        image_tensor = torch.from_numpy(image).float().permute(2, 0, 1)
+        mask_tensor = torch.from_numpy(mask).long()
+        voxels_tensor = torch.from_numpy(vox.astype(np.float32))
+
+        attr_tensor = self._process_attributes(attributes)
+        polygon_tensor = self._process_polygons(polygons_gt)
+
         # VALIDATION: Verify parameter ranges match dataset generation expectations
+        # FIX: Now attr_tensor is defined before we use it
         attr_array = attr_tensor.numpy()
 
         validation_failed = False
@@ -331,14 +334,6 @@ class AdvancedFloorPlanDataset(Dataset):
                 f"  This indicates dataset was generated with incorrect config.py values"
             )
             print(f"  Raw attributes: {attributes}")
-
-        # Convert to tensors
-        image_tensor = torch.from_numpy(image).float().permute(2, 0, 1)
-        mask_tensor = torch.from_numpy(mask).long()
-        voxels_tensor = torch.from_numpy(vox.astype(np.float32))
-
-        attr_tensor = self._process_attributes(attributes)
-        polygon_tensor = self._process_polygons(polygons_gt)
 
         # Apply augmentation if enabled
         if self.augment:
@@ -670,4 +665,4 @@ class SyntheticFloorPlanDataset(Dataset):
             "voxels_gt": voxels_tensor,
             "polygons_gt": polygon_tensor,
             "sample_id": f"synthetic_{idx:06d}",
-        }
+        }   

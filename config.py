@@ -26,7 +26,7 @@ class DataConfig:
     data_dir: str = "./data/floorplans"
     image_size: Tuple[int, int] = (256, 256)   # keep full resolution for accuracy
     voxel_size: int = 64
-    batch_size: int = 4                        # balance speed & memory
+    batch_size: int = 1                        # balance speed & memory
     num_workers: int = 8                       # faster dataloader (tune per CPU)
     augment: bool = True
 

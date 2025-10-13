@@ -8,7 +8,7 @@ import torch
 import torch.nn.utils
 
 # training/trainer.py - Fixed AMP imports
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 import time
 import numpy as np
 import random
@@ -130,7 +130,7 @@ class AdaptiveMultiStageTrainer:
 
         # Add AMP and optimization settings - Updated for new PyTorch API
         self.use_amp = getattr(config, "use_mixed_precision", True)
-        self.scaler = GradScaler(enabled=self.use_amp)
+        self.scaler = torch.amp.GradScaler(enabled=self.use_amp)
         self.accumulation_steps = getattr(config, "accumulation_steps", 1)
         self.dvx_step_freq = getattr(config, "dvx_step_freq", 1)
         self.voxel_size_stage = getattr(config, "voxel_size_stage", None)
@@ -309,7 +309,7 @@ class AdaptiveMultiStageTrainer:
                 (mode == "stage1" and self._step % 2 == 0)  # Every 4th step in stage 1
             )
 
-            with autocast("cuda", enabled=self.use_amp):
+            with torch.amp.autocast(device_type="cuda", enabled=self.use_amp):
                 predictions = self.model(
                     batch["image"], run_full_geometric=run_full_geometric
                 )
@@ -444,7 +444,7 @@ class AdaptiveMultiStageTrainer:
                     for k, v in batch.items()
                 }
 
-                with autocast("cuda", enabled=self.use_amp):
+                with torch.amp.autocast(device_type="cuda", enabled=self.use_amp):
                     # ALWAYS run full geometric in validation for consistency
                     predictions = self.model(batch["image"], run_full_geometric=True)
 
