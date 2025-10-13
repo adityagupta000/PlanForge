@@ -1,4 +1,4 @@
-# Neural-Geometric 3D Model Generator
+# 2D FloorPlan - 3D Model Generator
 
 A research-grade system for converting 2D floorplan images to 3D architectural models using neural networks and differentiable geometric operations.
 
