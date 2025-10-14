@@ -415,11 +415,19 @@ class ResearchGradeLoss(nn.Module):
                     total_loss = total_loss + self.weights[name] * loss
 
         # Final loss scaling and validation
-        total_loss = torch.clamp(total_loss, 0.0, 100.0)  # Prevent explosion
-        
         if not torch.isfinite(total_loss):
-            print("[ResearchGradeLoss] Warning: Non-finite total loss detected, using fallback")
-            total_loss = torch.tensor(1.0, device=device, requires_grad=True)
+            print("[ResearchGradeLoss] CRITICAL: Non-finite total loss detected!")
+            print(f"  Active component losses:")
+            for name, loss in losses.items():
+                if name != "total" and isinstance(loss, torch.Tensor):
+                    loss_val = loss.item() if torch.isfinite(loss) else "INF/NAN"
+                    print(f"    {name}: {loss_val}")
+            
+            # Create a small positive fallback loss to maintain gradient flow
+            total_loss = torch.tensor(0.01, device=device, requires_grad=True)
+        else:
+            # Clamp to reasonable range
+            total_loss = torch.clamp(total_loss, 0.0, 100.0)
 
         losses["total"] = total_loss
         return total_loss, losses
@@ -673,7 +681,6 @@ class ResearchGradeLoss(nn.Module):
 
         isolation_penalty = wall_prob * torch.exp(-neighbors)
         return isolation_penalty.mean()
-
 
 class LossScheduler:
     """Manages curriculum-based loss weight scheduling"""

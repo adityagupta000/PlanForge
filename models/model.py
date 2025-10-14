@@ -311,13 +311,39 @@ class NeuralGeometric3DGenerator(nn.Module):
             polygons = dvx_output.get("polygons", None)
             validity = dvx_output.get("validity", None)
 
-            # 3D extrusion (defensive: ensure inputs exist)
+            # 3D extrusion (defensive: ensure inputs exist and are valid)
             try:
-                voxels_pred = self.extrusion(polygons, attributes, validity)
+                # CRITICAL FIX: Validate inputs before extrusion
+                extrusion_safe = True
+                
+                if polygons is None or validity is None or attributes is None:
+                    print("[WARNING] Missing inputs for extrusion")
+                    extrusion_safe = False
+                elif torch.isnan(polygons).any() or torch.isinf(polygons).any():
+                    print(f"[WARNING] Invalid polygons detected (NaN/Inf count: {torch.isnan(polygons).sum().item() + torch.isinf(polygons).sum().item()})")
+                    extrusion_safe = False
+                elif torch.isnan(attributes).any() or torch.isinf(attributes).any():
+                    print(f"[WARNING] Invalid attributes detected (NaN/Inf count: {torch.isnan(attributes).sum().item() + torch.isinf(attributes).sum().item()})")
+                    extrusion_safe = False
+                elif torch.isnan(validity).any() or torch.isinf(validity).any():
+                    print(f"[WARNING] Invalid validity scores detected (NaN/Inf count: {torch.isnan(validity).sum().item() + torch.isinf(validity).sum().item()})")
+                    extrusion_safe = False
+                
+                if extrusion_safe:
+                    voxels_pred = self.extrusion(polygons, attributes, validity)
+                    
+                    # Post-extrusion validation
+                    if voxels_pred is not None:
+                        if torch.isnan(voxels_pred).any() or torch.isinf(voxels_pred).any():
+                            print(f"[WARNING] Extrusion produced invalid voxels (NaN/Inf count: {torch.isnan(voxels_pred).sum().item() + torch.isinf(voxels_pred).sum().item()})")
+                            voxels_pred = None
+                else:
+                    voxels_pred = None
+                    
             except Exception as e:
-                # Log or print a helpful message for debugging; avoid crashing training
-                # (Replace print with logger if you have one)
-                print(f"[Warning] extrusion failed: {e}")
+                print(f"[Warning] extrusion failed with exception: {e}")
+                import traceback
+                traceback.print_exc()
                 voxels_pred = None
 
             # Add geometric outputs

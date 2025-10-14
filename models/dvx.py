@@ -227,7 +227,10 @@ class DifferentiableVectorization(nn.Module):
         # predict displacements in [-1,1] via tanh on last layer
         disp = self.refine_net(input_feats)  # [B, P*N, 2], values ~[-1,1]
         disp = disp.view(B, P, N, 2)
-        disp = disp * self.displacement_scale  # scale
+        if torch.isnan(disp).any() or torch.isinf(disp).any():
+            return torch.zeros_like(disp)
+        disp = disp * self.displacement_scale
+        disp = torch.clamp(disp, -self.displacement_scale * 2.0, self.displacement_scale * 2.0)
         return disp
 
     def _predict_validity(self, polygons: torch.Tensor) -> torch.Tensor:

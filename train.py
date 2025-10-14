@@ -211,7 +211,7 @@ def main():
     # Basic arguments
     parser.add_argument("--data_dir", type=str, default="./data/floorplans", 
                        help="Path to dataset directory")
-    parser.add_argument("--batch_size", type=int, default=2, help="Batch size")
+    parser.add_argument("--batch_size", type=int, default=1, help="Batch size")
     parser.add_argument("--num_workers", type=int, default=4, help="Number of data workers")
     parser.add_argument("--device", type=str, default=None, help="Training device")
     parser.add_argument("--resume", type=str, default=None, help="Resume from checkpoint")
@@ -234,7 +234,7 @@ def main():
     
     parser.add_argument("--gradnorm", action="store_true", default=True,
                        help="Enable GradNorm dynamic loss weighting")
-    parser.add_argument("--gradnorm-alpha", type=float, default=0.12,
+    parser.add_argument("--gradnorm-alpha", type=float, default=0.08,
                        help="GradNorm restoring force parameter")
     parser.add_argument("--gradnorm-freq", type=int, default=5,
                        help="GradNorm update frequency (batches)")
@@ -242,9 +242,9 @@ def main():
     parser.add_argument("--topology-schedule", type=str, 
                        choices=["static", "progressive", "linear_ramp"], 
                        default="progressive", help="Topology loss scheduling strategy")
-    parser.add_argument("--topology-start", type=float, default=0.1,
+    parser.add_argument("--topology-start", type=float, default=0.05,
                        help="Starting weight for topology loss")
-    parser.add_argument("--topology-end", type=float, default=1.0,
+    parser.add_argument("--topology-end", type=float, default=0.5,
                        help="Ending weight for topology loss")
     
     # Model enhancements
@@ -258,16 +258,16 @@ def main():
     # Model architecture
     parser.add_argument("--input_channels", type=int, default=3, help="Input image channels")
     parser.add_argument("--num_classes", type=int, default=5, help="Number of segmentation classes")
-    parser.add_argument("--feature_dim", type=int, default=768, help="Feature dimension")
+    parser.add_argument("--feature_dim", type=int, default=512, help="Feature dimension")
     parser.add_argument("--num_attributes", type=int, default=6, help="Number of attribute predictions")
     parser.add_argument("--voxel_size", type=int, default=64, help="3D voxel grid size")
-    parser.add_argument("--max_polygons", type=int, default=30, help="Maximum number of polygons")
-    parser.add_argument("--max_points", type=int, default=100, help="Maximum points per polygon")
+    parser.add_argument("--max_polygons", type=int, default=20, help="Maximum number of polygons")
+    parser.add_argument("--max_points", type=int, default=50, help="Maximum points per polygon")
     
     # Dynamic epoch limits
     parser.add_argument("--max-stage1-epochs", type=int, default=50, help="Max epochs for Stage 1")
-    parser.add_argument("--max-stage2-epochs", type=int, default=35, help="Max epochs for Stage 2") 
-    parser.add_argument("--max-stage3-epochs", type=int, default=100, help="Max epochs for Stage 3")
+    parser.add_argument("--max-stage2-epochs", type=int, default=55, help="Max epochs for Stage 2") 
+    parser.add_argument("--max-stage3-epochs", type=int, default=70, help="Max epochs for Stage 3")
     
     parser.add_argument("--persistent_workers",action="store_true",default=False,help="Keep DataLoader workers alive between epochs (requires num_workers > 0).")
 
@@ -404,14 +404,14 @@ def main():
     # Save training summary
     save_training_summary(history, config, output_dir)
 
-    print(f"\n🎉 Enhanced training completed successfully!")
-    print(f"📊 Results saved to: {output_dir}")
-    print("\nNovel contributions implemented:")
-    print("- Dynamic curriculum learning with adaptive stage transitions")
-    print("- Multi-objective optimization with gradient-based reweighting") 
-    print("- Topology-aware progressive constraint injection")
-    print("- Cross-modal latent consistency learning")
-    print("- Graph-based architectural constraint learning")
+    print(f"\n Training completed successfully!")
+    print(f"Results saved to: {output_dir}")
+    # print("\nNovel contributions implemented:")
+    # print("- Dynamic curriculum learning with adaptive stage transitions")
+    # print("- Multi-objective optimization with gradient-based reweighting") 
+    # print("- Topology-aware progressive constraint injection")
+    # print("- Cross-modal latent consistency learning")
+    # print("- Graph-based architectural constraint learning")
 
 
 if __name__ == "__main__":

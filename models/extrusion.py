@@ -189,10 +189,20 @@ class DifferentiableExtrusion(nn.Module):
                 wall_height_normalized, sample_id=sid, default=0.5
             )
 
+            # CRITICAL FIX: Additional safety check after sanitization
+            if not (0.0 < sanitized_norm <= 1.0):
+                logger.warning(f"Sample {sid}: Sanitization failed - normalized height {sanitized_norm} still invalid, skipping")
+                continue
+
             wall_height_m = sanitized_norm * 2.0
             height_frac = wall_height_m / 2.0
             height_voxels = int(round(height_frac * D))
             height_voxels = max(1, min(D, height_voxels))
+
+            # Additional validation
+            if height_voxels < 1 or height_voxels > D:
+                logger.warning(f"Sample {sid}: Invalid height_voxels {height_voxels}, clamping to [1, {D}]")
+                height_voxels = max(1, min(D, height_voxels))
 
             # Process each polygon for this batch
             validity_mask = validity_scores[b] >= 0.5

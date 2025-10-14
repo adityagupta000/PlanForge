@@ -27,7 +27,7 @@ class DataConfig:
     image_size: Tuple[int, int] = (256, 256)   # keep full resolution for accuracy
     voxel_size: int = 64
     batch_size: int = 1                        # balance speed & memory
-    num_workers: int = 8                       # faster dataloader (tune per CPU)
+    num_workers: int = 4                       # faster dataloader (tune per CPU)
     augment: bool = True
 
 
@@ -80,7 +80,7 @@ class CurriculumConfig:
     dvx_step_freq = 1                     # run DVX refinement every N steps (1 = every step)
     persistent_workers = True             # DataLoader persistent workers
     prefetch_factor = 4                   # DataLoader prefetch
-    num_workers = 8                       # default num workers for DataLoader (tune by CPU)
+    num_workers = 4                       # default num workers for DataLoader (tune by CPU)
     # Progressive resolution settings (example)
     voxel_size_stage = { "stage1": 32, "stage2": 32, "stage3": 64 }  # voxel sizes per stage
     image_size_stage = { "stage1": (128,128), "stage2": (192,192), "stage3": (256,256)}
@@ -140,9 +140,9 @@ class TrainingConfig:
     max_stage3_epochs: int = 70
     
     # Minimum epochs per stage (avoid switching too early)
-    min_stage1_epochs: int = 8
+    min_stage1_epochs: int = 5
     min_stage2_epochs: int = 5
-    min_stage3_epochs: int = 12
+    min_stage3_epochs: int = 5
     
     # Learning rates (per stage)
     stage1_lr: float = 3e-4  # was 3e-4

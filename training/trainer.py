@@ -130,7 +130,8 @@ class AdaptiveMultiStageTrainer:
 
         # Add AMP and optimization settings - Updated for new PyTorch API
         self.use_amp = getattr(config, "use_mixed_precision", True)
-        self.scaler = torch.amp.GradScaler(enabled=self.use_amp)
+        # CRITICAL FIX: Use conservative scaler settings to prevent NaN explosions
+        self.scaler = torch.amp.GradScaler(enabled=self.use_amp,init_scale=2048.0,growth_factor=2.0,backoff_factor=0.5,growth_interval=1000)
         self.accumulation_steps = getattr(config, "accumulation_steps", 1)
         self.dvx_step_freq = getattr(config, "dvx_step_freq", 1)
         self.voxel_size_stage = getattr(config, "voxel_size_stage", None)
@@ -328,6 +329,11 @@ class AdaptiveMultiStageTrainer:
                     shared_params,
                     run_full_geometric=run_full_geometric,
                 )
+                
+                if not torch.isfinite(loss):
+                    print(f"\n[WARNING] Batch {batch_idx}: Non-finite loss detected ({loss.item()}), skipping backward pass")
+                    optimizer.zero_grad()  # Clear any partial gradients
+                    continue
 
                 # Scale for accumulation
                 loss = loss / self.accumulation_steps
@@ -341,6 +347,22 @@ class AdaptiveMultiStageTrainer:
                 # Enhanced gradient clipping
                 self.scaler.unscale_(optimizer)
                 
+                # CRITICAL FIX: Check for inf/nan gradients BEFORE stepping
+                has_inf_nan = False
+                for param in self.model.parameters():
+                    if param.grad is not None:
+                        if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                            has_inf_nan = True
+                            break
+                
+                if has_inf_nan:
+                    # Skip this update - zero gradients and continue
+                    print(f"\n[WARNING] Batch {batch_idx}: Detected inf/nan gradients - skipping optimizer step")
+                    optimizer.zero_grad()
+                    self.scaler.update()
+                    accumulated_loss = 0.0
+                    continue  # Skip to next batch
+                
                 # Adaptive gradient clipping based on loss magnitude
                 max_grad_norm = min(self.config.grad_clip_norm * (1.0 + accumulated_loss), 2.0)
                 torch.nn.utils.clip_grad_norm_(
@@ -350,7 +372,7 @@ class AdaptiveMultiStageTrainer:
                 self.scaler.step(optimizer)
                 self.scaler.update()
                 optimizer.zero_grad()
-                
+
                 # Reset accumulation
                 accumulated_loss = 0.0
 
@@ -403,7 +425,7 @@ class AdaptiveMultiStageTrainer:
                 avg_component_losses[name] = 0.0
 
         return total_loss / batch_count, avg_component_losses
-  
+
     def _prepare_targets(self, batch, mode):
         """Prepare targets based on training mode"""
         if mode == "stage1":

@@ -434,8 +434,8 @@ class AdvancedFloorPlanDataset(Dataset):
         1. Nested dict: { "walls": [...], "doors": [...], ... }
         2. Flat list:   [ {"type": "wall", "points": [...]}, ... ]
         """
-        max_polygons = 30  # number of polygons per sample
-        max_points = 100  # max points per polygon
+        max_polygons = 20  # number of polygons per sample
+        max_points = 50  # max points per polygon
 
         processed = torch.zeros(max_polygons, max_points, 2)
         valid_mask = torch.zeros(max_polygons, dtype=torch.bool)
