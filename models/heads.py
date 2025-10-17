@@ -1,5 +1,5 @@
 """
-Multi-task prediction heads for the 3D Model Generator
+Multi-task prediction heads for the Neural-Geometric 3D Model Generator
 """
 
 import torch

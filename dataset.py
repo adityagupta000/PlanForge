@@ -1,5 +1,5 @@
 """
-Dataset classes for the 3D Model Generator
+Dataset classes for the Neural-Geometric 3D Model Generator
 Enhanced with in-memory caching for faster training
 FIXED: UnboundLocalError in __getitem__ method
 """

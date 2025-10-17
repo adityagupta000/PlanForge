@@ -1,5 +1,6 @@
 """
 Research-grade inference engine for 2D to 3D floorplan generation
+Enhanced with robust model loading and checkpoint compatibility
 """
 
 import torch
@@ -27,14 +28,73 @@ class ResearchInferenceEngine:
         self.config = config
         self.model = NeuralGeometric3DGenerator()
 
-        # Load trained model
+        # Load trained model with robust state dict handling
         model_path = model_path or config.model_path
-        checkpoint = torch.load(model_path, map_location=device)
-        self.model.load_state_dict(checkpoint["model_state_dict"])
+        self._load_model_safely(model_path)
+        
         self.model.to(device)
         self.model.eval()
 
         print(f"Loaded trained model from {model_path}")
+
+    def _load_model_safely(self, model_path):
+        """
+        Load model checkpoint with flexible state dict matching
+        Handles keys that may not exist in current model architecture
+        """
+        checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
+        model_state = checkpoint.get("model_state_dict", checkpoint)
+
+        # Get current model keys
+        current_keys = set(self.model.state_dict().keys())
+        checkpoint_keys = set(model_state.keys())
+
+        # Find compatible and incompatible keys
+        compatible_state = {}
+        incompatible_keys = []
+        missing_keys = []
+
+        # Load only compatible parameters
+        for key, value in model_state.items():
+            if key in current_keys:
+                current_param = self.model.state_dict()[key]
+                
+                # Check shape compatibility
+                if current_param.shape == value.shape:
+                    compatible_state[key] = value
+                else:
+                    incompatible_keys.append(
+                        f"{key} (shape mismatch: {value.shape} -> {current_param.shape})"
+                    )
+            else:
+                # Skip keys that don't exist in current model (lazily-created modules)
+                incompatible_keys.append(f"{key} (not in current model - lazy module)")
+
+        # Check for missing keys
+        for key in current_keys:
+            if key not in model_state:
+                missing_keys.append(key)
+
+        # Load compatible state dict
+        self.model.load_state_dict(compatible_state, strict=False)
+
+        # Report loading status
+        print(f"\n[INFO] Model Loading Status:")
+        print(f"  ✓ Loaded {len(compatible_state)} compatible parameters")
+        
+        if incompatible_keys:
+            print(f"  ! Skipped {len(incompatible_keys)} incompatible/lazy parameters")
+            for key in incompatible_keys[:3]:  # Show first 3
+                print(f"    - {key}")
+            if len(incompatible_keys) > 3:
+                print(f"    ... and {len(incompatible_keys) - 3} more")
+
+        if missing_keys:
+            print(f"  ! {len(missing_keys)} parameters will use random initialization")
+            for key in missing_keys[:3]:  # Show first 3
+                print(f"    - {key}")
+            if len(missing_keys) > 3:
+                print(f"    ... and {len(missing_keys) - 3} more")
 
     def generate_3d_model(
         self, image_path: str, output_path: str, export_intermediate: bool = None
@@ -42,13 +102,14 @@ class ResearchInferenceEngine:
         """
         Complete pipeline: Image -> Segmentation -> Polygons -> 3D Model
         """
+
         export_intermediate = export_intermediate or self.config.export_intermediate
 
         # Load and preprocess image
         image = self._load_image(image_path)
 
         with torch.no_grad():
-
+            # Neural network inference
             predictions = self.model(image)
 
             # Extract predictions
@@ -56,6 +117,8 @@ class ResearchInferenceEngine:
             attributes = predictions["attributes"]
             polygons = predictions["polygons"]
             validity = predictions["polygon_validity"]
+
+            print("Neural network inference complete")
 
             # Convert to deterministic representations
             mask_np = self._extract_mask(segmentation)
@@ -101,37 +164,38 @@ class ResearchInferenceEngine:
 
         # Denormalize (reverse of normalization in dataset)
         attributes_dict = {
-            "wall_height": float(attr_np[0] * 2.0),  # Changed: multiply by 2.0
-            "wall_thickness": float(attr_np[1] * 0.5),  # Unchanged
-            "window_base_height": float(attr_np[2] * 0.5),  # Changed: multiply by 0.5
-            "window_height": float(attr_np[3] * 0.5),  # Changed: multiply by 0.5
-            "door_height": float(attr_np[4] * 2.0),  # Changed: multiply by 2.0
-            "pixel_scale": float(attr_np[5] * 0.02),  # Unchanged
+            "wall_height": float(attr_np[0] * 2.0),
+            "wall_thickness": float(attr_np[1] * 0.5),
+            "window_base_height": float(attr_np[2] * 0.5),
+            "window_height": float(attr_np[3] * 0.5),
+            "door_height": float(attr_np[4] * 2.0),
+            "pixel_scale": float(attr_np[5] * 0.02),
         }
 
         return attributes_dict
 
     def _extract_polygons(self, polygons, validity, threshold=None):
         """Extract valid polygons from network predictions"""
+
         threshold = threshold or self.config.polygon_threshold
         batch_size, num_polys, num_points, _ = polygons.shape
 
         polygons_list = []
 
         for poly_idx in range(num_polys):
-            if validity[0, poly_idx] > threshold:  # Only valid polygons
+            if validity[0, poly_idx] > threshold:
                 poly_points = polygons[0, poly_idx].cpu().numpy()
 
                 # Remove zero-padded points
                 valid_points = poly_points[poly_points.sum(axis=1) > 0]
 
-                if len(valid_points) >= 3:  # Minimum for a polygon
+                if len(valid_points) >= 3:
                     # Convert to image coordinates (assuming 256x256 input)
                     valid_points = valid_points * 256
                     polygons_list.append(
                         {
                             "points": valid_points.tolist(),
-                            "class": "wall",  # Simplified - in practice classify polygon type
+                            "class": "wall",
                         }
                     )
 
@@ -155,7 +219,7 @@ class ResearchInferenceEngine:
 
         # Visualize polygons on mask
         vis_img = np.zeros((256, 256, 3), dtype=np.uint8)
-        vis_img[:, :, 0] = mask * 50  # Background
+        vis_img[:, :, 0] = mask * 50
 
         for poly in polygons:
             points = np.array(poly["points"], dtype=np.int32)
@@ -179,7 +243,8 @@ class ResearchInferenceEngine:
             pixel_scale = attributes.get("pixel_scale", 0.01)
 
             print(
-                f"Generating 3D model with wall_height={wall_height:.2f}m, thickness={wall_thickness:.2f}m"
+                f"Generating 3D model with wall_height={wall_height:.2f}m, "
+                f"thickness={wall_thickness:.2f}m"
             )
 
             # Process each polygon (walls, rooms, etc.)
@@ -196,9 +261,9 @@ class ResearchInferenceEngine:
                 faces.extend(poly_faces)
                 vertex_count += len(poly_vertices)
 
-            # Add floor and ceiling
-            floor_verts, floor_faces = self._generate_floor_ceiling(
-                mask, pixel_scale, wall_height, vertex_count
+            # Add floor only (no ceiling/roof)
+            floor_verts, floor_faces = self._generate_floor_only(
+                mask, pixel_scale, vertex_count
             )
             vertices.extend(floor_verts)
             faces.extend(floor_faces)
@@ -226,6 +291,8 @@ class ResearchInferenceEngine:
 
         except Exception as e:
             print(f"Error generating 3D model: {str(e)}")
+            import traceback
+            traceback.print_exc()
             return False
 
     def _extrude_polygon_3d(self, points, height, thickness, scale, vertex_offset):
@@ -236,8 +303,8 @@ class ResearchInferenceEngine:
         # Convert points to 3D coordinates
         points_3d = []
         for point in points:
-            x = (point[0] - 128) * scale  # Center and scale
-            z = (128 - point[1]) * scale  # Flip Y and scale
+            x = (point[0] - 128) * scale
+            z = (128 - point[1]) * scale
             points_3d.append([x, 0, z])
 
         # Create bottom vertices (y=0)
@@ -259,18 +326,18 @@ class ResearchInferenceEngine:
             next_i = (i + 1) % n_points
 
             # Outer wall faces
-            v1 = vertex_offset + i  # bottom outer
-            v2 = vertex_offset + next_i  # bottom outer next
-            v3 = vertex_offset + 2 * n_points + next_i  # top outer next
-            v4 = vertex_offset + 2 * n_points + i  # top outer
+            v1 = vertex_offset + i
+            v2 = vertex_offset + next_i
+            v3 = vertex_offset + 2 * n_points + next_i
+            v4 = vertex_offset + 2 * n_points + i
 
             faces.extend([[v1, v2, v3], [v1, v3, v4]])
 
             # Inner wall faces (reverse winding)
-            v1 = vertex_offset + n_points + i  # bottom inner
-            v2 = vertex_offset + n_points + next_i  # bottom inner next
-            v3 = vertex_offset + 3 * n_points + next_i  # top inner next
-            v4 = vertex_offset + 3 * n_points + i  # top inner
+            v1 = vertex_offset + n_points + i
+            v2 = vertex_offset + n_points + next_i
+            v3 = vertex_offset + 3 * n_points + next_i
+            v4 = vertex_offset + 3 * n_points + i
 
             faces.extend([[v1, v3, v2], [v1, v4, v3]])
 
@@ -278,10 +345,10 @@ class ResearchInferenceEngine:
         for i in range(n_points):
             next_i = (i + 1) % n_points
 
-            v1 = vertex_offset + 2 * n_points + i  # top outer
-            v2 = vertex_offset + 2 * n_points + next_i  # top outer next
-            v3 = vertex_offset + 3 * n_points + next_i  # top inner next
-            v4 = vertex_offset + 3 * n_points + i  # top inner
+            v1 = vertex_offset + 2 * n_points + i
+            v2 = vertex_offset + 2 * n_points + next_i
+            v3 = vertex_offset + 3 * n_points + next_i
+            v4 = vertex_offset + 3 * n_points + i
 
             faces.extend([[v1, v2, v3], [v1, v3, v4]])
 
@@ -289,10 +356,10 @@ class ResearchInferenceEngine:
         for i in range(n_points):
             next_i = (i + 1) % n_points
 
-            v1 = vertex_offset + i  # bottom outer
-            v2 = vertex_offset + next_i  # bottom outer next
-            v3 = vertex_offset + n_points + next_i  # bottom inner next
-            v4 = vertex_offset + n_points + i  # bottom inner
+            v1 = vertex_offset + i
+            v2 = vertex_offset + next_i
+            v3 = vertex_offset + n_points + next_i
+            v4 = vertex_offset + n_points + i
 
             faces.extend([[v1, v3, v2], [v1, v4, v3]])
 
@@ -303,7 +370,6 @@ class ResearchInferenceEngine:
         if len(points) < 3:
             return points
 
-        # Simple inset by moving each point inward along angle bisector
         inset_points = []
         n = len(points)
 
@@ -338,13 +404,55 @@ class ResearchInferenceEngine:
             if bisector_len > 1e-6:
                 bisector /= bisector_len
 
-                # Move point inward
-                inset_point = p_curr - bisector * inset_distance
-                inset_points.append([inset_point[0], inset_point[1], inset_point[2]])
-            else:
-                inset_points.append(points[i])
+            # Move point inward
+            inset_point = p_curr - bisector * inset_distance
+            inset_points.append([inset_point[0], inset_point[1], inset_point[2]])
 
         return inset_points
+
+    def _generate_floor_only(self, mask, scale, vertex_offset):
+        """Generate floor geometry only (no ceiling/roof)"""
+        vertices = []
+        faces = []
+
+        # Find floor regions (assuming class 0 = floor/room)
+        floor_mask = (mask == 0).astype(np.uint8)
+
+        # Find contours
+        contours, _ = cv2.findContours(
+            floor_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+
+        for contour in contours:
+            if cv2.contourArea(contour) < 100:
+                continue
+
+            # Simplify contour
+            epsilon = 0.02 * cv2.arcLength(contour, True)
+            approx = cv2.approxPolyDP(contour, epsilon, True)
+
+            if len(approx) < 3:
+                continue
+
+            # Convert to 3D coordinates
+            floor_points = []
+            for point in approx.reshape(-1, 2):
+                x = (point[0] - 128) * scale
+                z = (128 - point[1]) * scale
+                floor_points.append([x, 0, z])
+
+            # Add vertices
+            n_points = len(floor_points)
+            vertices.extend(floor_points)
+
+            # Triangulate floor
+            if n_points >= 3:
+                for i in range(1, n_points - 1):
+                    faces.append([vertex_offset, vertex_offset + i + 1, vertex_offset + i])
+
+            vertex_offset += n_points
+
+        return vertices, faces
 
     def _generate_floor_ceiling(self, mask, scale, wall_height, vertex_offset):
         """Generate floor and ceiling geometry from segmentation mask"""
@@ -360,7 +468,7 @@ class ResearchInferenceEngine:
         )
 
         for contour in contours:
-            if cv2.contourArea(contour) < 100:  # Skip small regions
+            if cv2.contourArea(contour) < 100:
                 continue
 
             # Simplify contour
@@ -375,13 +483,13 @@ class ResearchInferenceEngine:
             for point in approx.reshape(-1, 2):
                 x = (point[0] - 128) * scale
                 z = (128 - point[1]) * scale
-                floor_points.append([x, 0, z])  # Floor at y=0
+                floor_points.append([x, 0, z])
 
             ceiling_points = []
             for point in approx.reshape(-1, 2):
                 x = (point[0] - 128) * scale
                 z = (128 - point[1]) * scale
-                ceiling_points.append([x, wall_height, z])  # Ceiling at y=wall_height
+                ceiling_points.append([x, wall_height, z])
 
             # Add vertices
             n_points = len(floor_points)
@@ -391,19 +499,17 @@ class ResearchInferenceEngine:
             # Triangulate floor
             if n_points >= 3:
                 for i in range(1, n_points - 1):
-                    faces.append(
-                        [vertex_offset, vertex_offset + i + 1, vertex_offset + i]
-                    )
+                    faces.append([vertex_offset, vertex_offset + i + 1, vertex_offset + i])
 
-                # Triangulate ceiling (reverse winding)
-                for i in range(1, n_points - 1):
-                    faces.append(
-                        [
-                            vertex_offset + n_points,
-                            vertex_offset + n_points + i,
-                            vertex_offset + n_points + i + 1,
-                        ]
-                    )
+            # Triangulate ceiling (reverse winding)
+            for i in range(1, n_points - 1):
+                faces.append(
+                    [
+                        vertex_offset + n_points,
+                        vertex_offset + n_points + i,
+                        vertex_offset + n_points + i + 1,
+                    ]
+                )
 
             vertex_offset += 2 * n_points
 
