@@ -1,8 +1,6 @@
-# Python version requirement
-# Python==3.10.x
 
 # ============================================================================
-# CORE PYTORCH & DEEP LEARNING (Foundation Layer)
+# CORE PYTORCH & DEEP LEARNING
 # ============================================================================
 torch==2.0.1
 torchvision==0.15.2
@@ -22,6 +20,7 @@ pandas==2.0.3
 opencv-python==4.8.1.78
 opencv-contrib-python==4.8.1.78
 Pillow==10.0.1
+imageio==2.33.1
 
 # ============================================================================
 # 3D GRAPHICS, MESH PROCESSING & GEOMETRY
@@ -45,6 +44,7 @@ tqdm==4.66.1
 # ============================================================================
 h5py==3.9.0
 PyYAML==6.0.1
+joblib==1.3.2
 
 # ============================================================================
 # OPTIONAL: Development & Testing Tools
