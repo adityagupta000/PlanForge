@@ -24,7 +24,7 @@ class DifferentiableVectorization(nn.Module):
         max_polygons: int = 20,
         max_points: int = 50,
         feature_dim: int = 256,
-        displacement_scale: float = 0.12,
+        displacement_scale: float = 0.08,
         num_refinement_steps: int = 3,
         align_corners: bool = False,
         padding_mode: str = "border",  # options for grid_sample

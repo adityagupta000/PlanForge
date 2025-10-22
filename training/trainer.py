@@ -131,7 +131,7 @@ class AdaptiveMultiStageTrainer:
         # Add AMP and optimization settings - Updated for new PyTorch API
         self.use_amp = getattr(config, "use_mixed_precision", True)
         # CRITICAL FIX: Use conservative scaler settings to prevent NaN explosions
-        self.scaler = torch.amp.GradScaler(enabled=self.use_amp,init_scale=2048.0,growth_factor=2.0,backoff_factor=0.5,growth_interval=1000)
+        self.scaler = torch.amp.GradScaler(enabled=self.use_amp,init_scale=512.0,growth_factor=1.5,backoff_factor=0.25,growth_interval=1000)
         self.accumulation_steps = getattr(config, "accumulation_steps", 1)
         self.dvx_step_freq = getattr(config, "dvx_step_freq", 1)
         self.voxel_size_stage = getattr(config, "voxel_size_stage", None)
@@ -371,6 +371,18 @@ class AdaptiveMultiStageTrainer:
 
                 self.scaler.step(optimizer)
                 self.scaler.update()
+                # Post-step NaN/infinity check
+                model_has_nan = False
+                for name, param in self.model.named_parameters():
+                    if torch.isnan(param).any() or torch.isinf(param).any():
+                        print(f"\n[CRITICAL] Model parameter {name} became NaN/Inf after optimizer step!")
+                        model_has_nan = True
+                        break
+                
+                if model_has_nan:
+                    print("[CRITICAL] Model weights corrupted during training - stopping")
+                    raise RuntimeError("Model weights became NaN/Inf - training cannot continue")
+                
                 optimizer.zero_grad()
 
                 # Reset accumulation
@@ -450,6 +462,18 @@ class AdaptiveMultiStageTrainer:
 
     def _validate(self, mode="stage1"):
         """Enhanced validation with consistent loss computation"""
+        model_has_nan = False
+        for name, param in self.model.named_parameters():
+            if torch.isnan(param).any() or torch.isinf(param).any():
+                print(f"\n[CRITICAL] Model parameter {name} has NaN/Inf before validation!")
+                model_has_nan = True
+                break
+    
+        if model_has_nan:
+            print("[ERROR] Cannot validate - model weights are corrupted")
+            print("Stopping training - model diverged in previous epoch")
+            raise RuntimeError("Model validation aborted - NaN/Inf in model weights")
+    
         self.model.eval()
         total_loss = 0
         component_loss_sums = {}

@@ -151,7 +151,7 @@ class TrainingConfig:
     stage2_lr: float = 1e-4  # was 1e-4 
     stage2_weight_decay: float = 1e-5
     
-    stage3_lr: float = 5e-5  # was 5e-5
+    stage3_lr: float = 1e-5  # was 5e-5
     stage3_weight_decay: float = 1e-5
     
     # Advanced training techniques
