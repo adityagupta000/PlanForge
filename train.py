@@ -267,7 +267,7 @@ def main():
     # Dynamic epoch limits
     parser.add_argument("--max-stage1-epochs", type=int, default=50, help="Max epochs for Stage 1")
     parser.add_argument("--max-stage2-epochs", type=int, default=55, help="Max epochs for Stage 2") 
-    parser.add_argument("--max-stage3-epochs", type=int, default=70, help="Max epochs for Stage 3")
+    parser.add_argument("--max-stage3-epochs", type=int, default=150, help="Max epochs for Stage 3")
     
     parser.add_argument("--persistent_workers",action="store_true",default=False,help="Keep DataLoader workers alive between epochs (requires num_workers > 0).")
 

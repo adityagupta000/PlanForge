@@ -137,7 +137,7 @@ class TrainingConfig:
     # Dynamic epoch limits (maxima; curriculum may switch earlier)
     max_stage1_epochs: int = 50
     max_stage2_epochs: int = 55
-    max_stage3_epochs: int = 70
+    max_stage3_epochs: int = 150
     
     # Minimum epochs per stage (avoid switching too early)
     min_stage1_epochs: int = 5
